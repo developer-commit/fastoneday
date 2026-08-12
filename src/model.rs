@@ -1,0 +1,12 @@
+#[path = "model/acquisition_model.rs"]
+pub mod acquisition;
+#[path = "model/catalog_model.rs"]
+pub mod catalog;
+#[path = "model/cve_model.rs"]
+pub mod cve;
+#[path = "model/driver_model.rs"]
+pub mod driver;
+#[path = "model/uup_model.rs"]
+pub mod uup;
+#[path = "model/winbindex_model.rs"]
+pub mod winbindex;
