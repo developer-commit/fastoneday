@@ -507,15 +507,16 @@ pub(crate) fn architecture_from_os(value: &str) -> Result<Architecture, Winbinde
     if normalized.contains("arm64") || normalized.contains("aarch64") {
         return Ok(Architecture::Arm64);
     }
+    if ARCH_X86.is_match(&normalized) {
+        return Err(WinbindexError::UnsupportedArchitecture {
+            value: format!("32-bit target: {value}"),
+        });
+    }
     if ARCH_X64.is_match(&normalized) || SERVER_OS.is_match(&normalized) {
         return Ok(Architecture::X64);
     }
     Err(WinbindexError::UnsupportedArchitecture {
-        value: if ARCH_X86.is_match(&normalized) {
-            format!("32-bit target: {value}")
-        } else {
-            value.into()
-        },
+        value: value.into(),
     })
 }
 
@@ -661,7 +662,7 @@ fn validate_destination(destination: &Path) -> Result<(), WinbindexError> {
 mod tests {
     use serde_json::json;
 
-    use super::select_record;
+    use super::{architecture_from_os, select_record};
     use crate::model::{acquisition::Architecture, winbindex::WinbindexResolveRequest};
 
     #[test]
@@ -688,5 +689,12 @@ mod tests {
         let selected = select_record(&records, &request, Architecture::X64).unwrap();
         assert_eq!(selected.sha256, sha);
         assert_eq!(selected.matched_alias, "11-24H2");
+    }
+
+    #[test]
+    fn does_not_treat_a_32_bit_server_as_x64() {
+        assert!(
+            architecture_from_os("Windows Server 2008 for 32-bit Systems Service Pack 2").is_err()
+        );
     }
 }

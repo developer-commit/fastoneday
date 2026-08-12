@@ -55,16 +55,16 @@ Catalog fallback이 필요한지는 실행 전에 확정할 수 없으므로, `d
 
 ```bash
 curl -L \
-  https://github.com/developer-commit/fastoneday/releases/download/v0.1.0/fastoneday-v0.1.0-aarch64-apple-darwin \
+  https://github.com/developer-commit/fastoneday/releases/download/v0.2.0/fastoneday-v0.2.0-aarch64-apple-darwin \
   -o fastoneday
 chmod +x fastoneday
 ./fastoneday --help
 ```
 
-v0.1.0 바이너리의 SHA-256은 다음과 같습니다.
+v0.2.0 바이너리의 SHA-256은 다음과 같습니다.
 
 ```text
-a02aafbc23ec48f98b4162285e429e58a89b699274deea3eb6792909bb576a81
+74e96b945badb3a8abbeafe3790d0cfea51e3ced370c519bdaca77a41abeeeed
 ```
 
 이 바이너리는 Apple의 공증을 받지 않았습니다. 운영체제 보안 정책으로 실행할 수 없는
@@ -86,15 +86,22 @@ cargo build --release --locked
 fastoneday info CVE-2022-37969
 ```
 
-`info`가 출력한 정확한 제품명을 사용해 패치 전후 파일을 받습니다.
+`info`는 다운로드 가능한 KB 쌍마다 `[번호]`를 표시합니다. 같은 이후 KB가 여러 이전
+KB를 대체하면 각 쌍을 별도 번호로 표시합니다. MSRC가 이전 KB를 제공하지 않거나 이전
+KB와 이후 KB가 같은 잘못된 관계는 다운로드 목록에 넣지 않습니다.
+
+원하는 제품·아키텍처·업데이트 종류의 번호를 사용해 패치 전후 파일을 받습니다.
 
 ```bash
 fastoneday download \
   CVE-2022-37969 \
-  'Windows 11 version 21H2 for x64-based Systems' \
+  11 \
   ./output \
   --driver clfs.sys
 ```
+
+번호는 현재 MSRC 응답을 정렬한 `info` 목록을 기준으로 하므로 다운로드 전에 `info`에서
+확인해야 합니다.
 
 결과는 다음 위치에 기록됩니다.
 

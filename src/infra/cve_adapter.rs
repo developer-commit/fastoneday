@@ -12,7 +12,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     errors::{CveError, MsrcEndpoint},
-    model::cve::{BeforeKb, CveMetadata, MsrcArticle, MsrcFetchResult, MsrcRawData, ProductPatch},
+    model::cve::{CveMetadata, MsrcArticle, MsrcFetchResult, MsrcRawData, ProductPatch},
     port::CvePort,
 };
 
@@ -20,6 +20,9 @@ const DEFAULT_BASE_URL: &str = "https://api.msrc.microsoft.com/sug/v2.0/en-US";
 
 static KB_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bKB\s*([0-9]+)\b").expect("valid KB regex"));
+static SUPERSEDENCE_KB_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:\bKB\s*)?([0-9]+)\b").expect("valid supersedence KB regex")
+});
 static HTML_TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<[^>]+>").expect("valid HTML tag regex"));
 
@@ -191,7 +194,8 @@ pub fn normalize_msrc(raw: &MsrcRawData) -> Result<CveMetadata, CveError> {
     }
 
     let products = optional_array(affected, "value", MsrcEndpoint::AffectedProduct)?;
-    let mut patches = BTreeMap::<(String, String, String), ProductPatch>::new();
+    let mut patches =
+        BTreeMap::<(String, String, String, String, String, u64), ProductPatch>::new();
     for (product_index, product) in products.iter().enumerate() {
         let product = require_object(
             product,
@@ -202,6 +206,21 @@ pub fn normalize_msrc(raw: &MsrcRawData) -> Result<CveMetadata, CveError> {
             .unwrap_or_default()
             .trim()
             .to_owned();
+        let product_id = product
+            .get("productId")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| CveError::InvalidPayload {
+                endpoint: MsrcEndpoint::AffectedProduct,
+                reason: format!("value[{product_index}].productId must be a non-negative integer"),
+            })?;
+        let cpe = optional_text(product, "cpe", MsrcEndpoint::AffectedProduct)?.unwrap_or_default();
+        let architecture = normalize_architecture(
+            optional_text(product, "architecture", MsrcEndpoint::AffectedProduct)?
+                .as_deref()
+                .unwrap_or_default(),
+            &os_version,
+            &cpe,
+        );
         let articles = optional_array(product, "kbArticles", MsrcEndpoint::AffectedProduct)?;
 
         for (article_index, article) in articles.iter().enumerate() {
@@ -210,6 +229,21 @@ pub fn normalize_msrc(raw: &MsrcRawData) -> Result<CveMetadata, CveError> {
                 MsrcEndpoint::AffectedProduct,
                 &format!("value[{product_index}].kbArticles[{article_index}]"),
             )?;
+            // `supercedence` is a 0..N set of incoming edges, not a list from
+            // which one predecessor should be guessed.
+            let before_kbs =
+                normalize_kb_candidates(article.get("supercedence")).map_err(|()| {
+                    CveError::InvalidPayload {
+                        endpoint: MsrcEndpoint::AffectedProduct,
+                        reason: format!(
+                            "value[{product_index}].kbArticles[{article_index}].supercedence \
+                         must be a string or non-negative integer"
+                        ),
+                    }
+                })?;
+            if before_kbs.is_empty() {
+                continue;
+            }
             let after_kb = article
                 .get("articleName")
                 .and_then(normalize_kb)
@@ -220,30 +254,43 @@ pub fn normalize_msrc(raw: &MsrcRawData) -> Result<CveMetadata, CveError> {
                          does not identify a patched KB"
                     ),
                 })?;
-            let candidates = normalize_kb_candidates(article.get("supercedence"));
-            let before_kb = match candidates.len() {
-                0 => BeforeKb::Missing,
-                1 => BeforeKb::Available(candidates[0].clone()),
-                _ => BeforeKb::Ambiguous(candidates.clone()),
-            };
-            let key = (
-                os_version.to_ascii_lowercase(),
-                after_kb.clone(),
-                candidates.join("|"),
-            );
-            let candidate = ProductPatch {
-                os_version: os_version.clone(),
-                before_kb,
-                after_kb,
-            };
-            patches
-                .entry(key)
-                .and_modify(|current| {
-                    if candidate.os_version < current.os_version {
-                        *current = candidate.clone();
-                    }
-                })
-                .or_insert(candidate);
+            let update_kind =
+                optional_text(article, "downloadName", MsrcEndpoint::AffectedProduct)?
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+
+            for before_kb in before_kbs {
+                // A supersedence edge must be irreflexive. MSRC occasionally
+                // publishes the patched article itself in this field.
+                if before_kb == after_kb {
+                    continue;
+                }
+                let key = (
+                    os_version.to_ascii_lowercase(),
+                    architecture.to_ascii_lowercase(),
+                    update_kind.to_ascii_lowercase(),
+                    after_kb.clone(),
+                    before_kb.clone(),
+                    product_id,
+                );
+                let candidate = ProductPatch {
+                    product_id,
+                    os_version: os_version.clone(),
+                    architecture: architecture.clone(),
+                    update_kind: update_kind.clone(),
+                    before_kb,
+                    after_kb: after_kb.clone(),
+                };
+                patches
+                    .entry(key)
+                    .and_modify(|current| {
+                        if candidate.os_version < current.os_version {
+                            *current = candidate.clone();
+                        }
+                    })
+                    .or_insert(candidate);
+            }
         }
     }
 
@@ -390,26 +437,68 @@ fn normalize_kb(value: &Value) -> Option<String> {
         .map(|number| format!("KB{}", number.as_str()))
 }
 
-fn normalize_kb_candidates(value: Option<&Value>) -> Vec<String> {
+fn normalize_kb_candidates(value: Option<&Value>) -> Result<Vec<String>, ()> {
     let Some(value) = value else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
     if let Some(number) = value.as_u64() {
-        return vec![format!("KB{number}")];
+        return Ok(vec![format!("KB{number}")]);
     }
     let Some(text) = value.as_str() else {
-        return Vec::new();
+        return Err(());
     };
-    if text.bytes().all(|byte| byte.is_ascii_digit()) && !text.is_empty() {
-        return vec![format!("KB{text}")];
-    }
-    KB_PATTERN
+    Ok(SUPERSEDENCE_KB_PATTERN
         .captures_iter(text)
         .filter_map(|capture| capture.get(1))
         .map(|number| format!("KB{}", number.as_str()))
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect()
+        .collect())
+}
+
+fn normalize_architecture(value: &str, os_version: &str, cpe: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" => infer_architecture(os_version, cpe),
+        "x64" | "amd64" => "x64".into(),
+        "x86" => "x86".into(),
+        "arm64" | "aarch64" => "arm64".into(),
+        "arm"
+            if os_version.to_ascii_lowercase().contains("arm64")
+                || cpe.to_ascii_lowercase().contains(":arm64:") =>
+        {
+            "arm64".into()
+        }
+        "arm" => "arm".into(),
+        _ => normalized,
+    }
+}
+
+fn infer_architecture(os_version: &str, cpe: &str) -> String {
+    let normalized = os_version.to_ascii_lowercase();
+    let cpe = cpe.to_ascii_lowercase();
+    if normalized.contains("arm64") || normalized.contains("aarch64") || cpe.contains(":arm64:") {
+        "arm64".into()
+    } else if normalized.contains("itanium")
+        || normalized.contains("ia64")
+        || cpe.contains(":ia64:")
+    {
+        "ia64".into()
+    } else if normalized.contains("32-bit") || normalized.contains("x86") || cpe.contains(":x86:") {
+        "x86".into()
+    } else if normalized.contains("x64")
+        || normalized.contains("64-bit")
+        || normalized.contains("server")
+    {
+        "x64".into()
+    } else if normalized.contains("windows rt") {
+        "arm".into()
+    } else {
+        "unknown".into()
+    }
 }
 
 fn plain_text(value: &str) -> String {
@@ -430,10 +519,24 @@ fn plain_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{normalize_cve_code, normalize_msrc};
-    use crate::model::cve::{BeforeKb, MsrcRawData};
+    use crate::model::cve::MsrcRawData;
+
+    fn raw(products: Value) -> MsrcRawData {
+        MsrcRawData {
+            cve_code: "CVE-2026-1234".into(),
+            vulnerability_response: json!({
+                "cveNumber": "CVE-2026-1234",
+                "cveTitle": "Example",
+                "articles": [],
+                "cweList": []
+            }),
+            affected_product_response: json!({"value": products}),
+            fetched_at: String::new(),
+        }
+    }
 
     #[test]
     fn rejects_malformed_cve_codes() {
@@ -445,31 +548,155 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_kb_state_without_redundant_fields() {
-        let raw = MsrcRawData {
-            cve_code: "CVE-2026-1234".into(),
-            vulnerability_response: json!({
-                "cveNumber": "CVE-2026-1234",
-                "cveTitle": "Example",
-                "articles": [],
-                "cweList": []
-            }),
-            affected_product_response: json!({
-                "value": [{
-                    "product": "Windows 11 Version 24H2 for x64-based Systems",
-                    "kbArticles": [{
-                        "articleName": "KB5000003",
-                        "supercedence": "KB5000001, KB5000002"
-                    }]
-                }]
-            }),
-            fetched_at: String::new(),
-        };
+    fn expands_every_supersedence_value_into_an_exact_edge() {
+        let metadata = normalize_msrc(&raw(json!([{
+            "productId": 12390,
+            "product": "Windows 11 Version 24H2 for x64-based Systems",
+            "architecture": "x64",
+            "kbArticles": [{
+                "articleName": "KB5000003",
+                "downloadName": "Security Update",
+                "supercedence": "5000001, KB5000002"
+            }]
+        }])))
+        .unwrap();
 
-        let metadata = normalize_msrc(&raw).unwrap();
-        assert!(matches!(
-            metadata.catalog[0].before_kb,
-            BeforeKb::Ambiguous(_)
-        ));
+        assert_eq!(metadata.catalog.len(), 2);
+        assert_eq!(metadata.catalog[0].before_kb, "KB5000001");
+        assert_eq!(metadata.catalog[1].before_kb, "KB5000002");
+        assert!(
+            metadata
+                .catalog
+                .iter()
+                .all(|patch| patch.after_kb == "KB5000003")
+        );
+        assert_eq!(metadata.catalog[0].product_id, 12390);
+        assert_eq!(metadata.catalog[0].architecture, "x64");
+        assert_eq!(metadata.catalog[0].update_kind, "Security Update");
+    }
+
+    #[test]
+    fn omits_articles_without_an_edge_and_self_edges() {
+        let metadata = normalize_msrc(&raw(json!([{
+            "productId": 9312,
+            "product": "Windows Server 2008 for 32-bit Systems Service Pack 2",
+            "architecture": "x86",
+            "kbArticles": [
+                {
+                    "articleName": "5017358",
+                    "downloadName": "Monthly Rollup",
+                    "supercedence": "5016669"
+                },
+                {
+                    "articleName": "not a KB article",
+                    "downloadName": "Security Only"
+                },
+                {
+                    "articleName": "5019999",
+                    "downloadName": "Bad API row",
+                    "supercedence": "5019999"
+                }
+            ]
+        }])))
+        .unwrap();
+
+        assert_eq!(metadata.catalog.len(), 1);
+        let patch = &metadata.catalog[0];
+        assert_eq!(patch.architecture, "x86");
+        assert_eq!(patch.update_kind, "Monthly Rollup");
+        assert_eq!(patch.before_kb, "KB5016669");
+        assert_eq!(patch.after_kb, "KB5017358");
+    }
+
+    #[test]
+    fn preserves_multiple_valid_update_channels() {
+        let metadata = normalize_msrc(&raw(json!([{
+            "productId": 12390,
+            "product": "Windows 11 Version 24H2 for x64-based Systems",
+            "architecture": "x64",
+            "kbArticles": [
+                {
+                    "articleName": "5079473",
+                    "downloadName": "Security Update",
+                    "supercedence": "5077181"
+                },
+                {
+                    "articleName": "5084597",
+                    "downloadName": "Hotpatch",
+                    "supercedence": "5077212"
+                }
+            ]
+        }])))
+        .unwrap();
+
+        assert_eq!(metadata.catalog.len(), 2);
+        assert_eq!(metadata.catalog[0].update_kind, "Hotpatch");
+        assert_eq!(metadata.catalog[1].update_kind, "Security Update");
+    }
+
+    #[test]
+    fn normalizes_msrc_arm_to_the_architecture_named_by_the_product() {
+        let metadata = normalize_msrc(&raw(json!([{
+            "productId": 12389,
+            "product": "Windows 11 Version 24H2 for ARM64-based Systems",
+            "architecture": "ARM",
+            "kbArticles": [{
+                "articleName": "5000002",
+                "downloadName": "Security Update",
+                "supercedence": "5000001"
+            }]
+        }])))
+        .unwrap();
+
+        assert_eq!(metadata.catalog[0].architecture, "arm64");
+    }
+
+    #[test]
+    fn uses_cpe_to_distinguish_modern_arm64_from_arm32() {
+        let metadata = normalize_msrc(&raw(json!([{
+            "productId": 20437,
+            "product": "Windows 11 Version 25H2 for ARM systems",
+            "architecture": "ARM",
+            "cpe": "cpe:2.3:o:microsoft:windows_11_25H2:{bv}:*:*:*:*:*:arm64:*",
+            "kbArticles": [{
+                "articleName": "5000002",
+                "downloadName": "Security Update",
+                "supercedence": "5000001"
+            }]
+        }])))
+        .unwrap();
+
+        assert_eq!(metadata.catalog[0].architecture, "arm64");
+    }
+
+    #[test]
+    fn infers_architecture_when_legacy_msrc_rows_omit_it() {
+        let metadata = normalize_msrc(&raw(json!([
+            {
+                "productId": 10048,
+                "product": "Windows 7 for x64-based Systems Service Pack 1",
+                "architecture": null,
+                "kbArticles": [{
+                    "articleName": "4093118",
+                    "downloadName": "Monthly Rollup",
+                    "supercedence": "4088875, 4100480"
+                }]
+            },
+            {
+                "productId": 9312,
+                "product": "Windows Server 2008 for 32-bit Systems Service Pack 2",
+                "architecture": null,
+                "kbArticles": [{
+                    "articleName": "4093224",
+                    "downloadName": "Security Update",
+                    "supercedence": "4089344"
+                }]
+            }
+        ])))
+        .unwrap();
+
+        assert_eq!(metadata.catalog.len(), 3);
+        assert_eq!(metadata.catalog[0].architecture, "x64");
+        assert_eq!(metadata.catalog[2].architecture, "x86");
     }
 }

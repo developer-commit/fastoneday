@@ -6,9 +6,22 @@ use thiserror::Error;
 use crate::errors::{
     CatalogError, ClassifiedError, CveError, DriverError, ErrorCode, WinbindexError,
 };
+use crate::model::{acquisition::Architecture, cve::ProductPatch};
 
 pub use download_service::{DownloadRequest, DownloadService, ProductDownload};
 pub use info_service::{CveInfo, InfoService};
+
+pub(crate) fn downloadable_patches(
+    catalog: &[ProductPatch],
+) -> impl Iterator<Item = (&ProductPatch, Architecture)> {
+    catalog
+        .iter()
+        .filter_map(|patch| match patch.architecture.as_str() {
+            "x64" => Some((patch, Architecture::X64)),
+            "arm64" => Some((patch, Architecture::Arm64)),
+            _ => None,
+        })
+}
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -30,29 +43,10 @@ pub enum ServiceError {
         candidates: Vec<String>,
     },
 
-    #[error("product `{requested}` was not found; available products: {available:?}")]
-    ProductNotFound {
-        requested: String,
-        available: Vec<String>,
-    },
-
-    #[error("product `{requested}` matches more than one patch row: {candidates:?}")]
-    AmbiguousProduct {
-        requested: String,
-        candidates: Vec<String>,
-    },
-
-    #[error("a before KB must be selected for `{product}`; candidates: {candidates:?}")]
-    BeforeKbRequired {
-        product: String,
-        candidates: Vec<String>,
-    },
-
-    #[error("before KB `{value}` is not valid for `{product}`; candidates: {candidates:?}")]
-    InvalidBeforeKb {
-        product: String,
-        value: String,
-        candidates: Vec<String>,
+    #[error("selection number {selection_number} is outside the displayed range 1..={available}")]
+    SelectionNumberOutOfRange {
+        selection_number: usize,
+        available: usize,
     },
 }
 
@@ -70,11 +64,7 @@ impl ClassifiedError for ServiceError {
                     ErrorCode::AmbiguousSelection
                 }
             }
-            Self::ProductNotFound { .. } => ErrorCode::NotFound,
-            Self::AmbiguousProduct { .. } | Self::BeforeKbRequired { .. } => {
-                ErrorCode::AmbiguousSelection
-            }
-            Self::InvalidBeforeKb { .. } => ErrorCode::InvalidInput,
+            Self::SelectionNumberOutOfRange { .. } => ErrorCode::InvalidInput,
         }
     }
 
@@ -84,11 +74,7 @@ impl ClassifiedError for ServiceError {
             Self::Driver(error) => error.retryable(),
             Self::Winbindex(error) => error.retryable(),
             Self::Catalog(error) => error.retryable(),
-            Self::DriverNotConfirmed { .. }
-            | Self::ProductNotFound { .. }
-            | Self::AmbiguousProduct { .. }
-            | Self::BeforeKbRequired { .. }
-            | Self::InvalidBeforeKb { .. } => false,
+            Self::DriverNotConfirmed { .. } | Self::SelectionNumberOutOfRange { .. } => false,
         }
     }
 }

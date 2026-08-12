@@ -4,16 +4,17 @@ use crate::{
     errors::{ClassifiedError, ErrorCode},
     infra::{CatalogAdapter, CveAdapter, DriverAdapter, WinbindexAdapter},
     model::driver::DriverOutcome,
-    service::{DownloadRequest, DownloadService, InfoService, ServiceError},
+    service::{DownloadRequest, DownloadService, InfoService, ServiceError, downloadable_patches},
 };
 
 const USAGE: &str = "Usage:
   fastoneday info <CVE>
-  fastoneday download <CVE> <PRODUCT> <OUTPUT>
+  fastoneday download <CVE> <NUMBER> <OUTPUT>
+
+NUMBER is the [N] shown by the info command.
 
 Options:
   --driver <DRIVER>
-  --before-kb <KB>
   --before-sha256 <SHA256>
   --after-sha256 <SHA256>";
 
@@ -49,7 +50,6 @@ enum Command {
 #[derive(Default)]
 struct Options {
     driver: Option<String>,
-    before_kb: Option<String>,
     before_sha256: Option<String>,
     after_sha256: Option<String>,
 }
@@ -70,7 +70,6 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, String>
     match command.as_str() {
         "info"
             if positionals.len() == 1
-                && options.before_kb.is_none()
                 && options.before_sha256.is_none()
                 && options.after_sha256.is_none() =>
         {
@@ -80,16 +79,24 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, String>
             })
         }
         "info" => Err("info requires exactly one CVE".into()),
-        "download" if positionals.len() == 3 => Ok(Command::Download(DownloadRequest {
-            cve_code: positionals[0].clone(),
-            product: positionals[1].clone(),
-            output_directory: PathBuf::from(&positionals[2]),
-            driver_override: options.driver,
-            before_kb: options.before_kb,
-            before_sha256: options.before_sha256,
-            after_sha256: options.after_sha256,
-        })),
-        "download" => Err("download requires CVE, PRODUCT, and OUTPUT".into()),
+        "download" if positionals.len() == 3 => {
+            let selection_number = positionals[1]
+                .parse::<usize>()
+                .map_err(|_| "download NUMBER must be a positive integer".to_string())?;
+            if selection_number == 0 {
+                return Err("download NUMBER must be a positive integer".into());
+            }
+
+            Ok(Command::Download(DownloadRequest {
+                cve_code: positionals[0].clone(),
+                selection_number,
+                output_directory: PathBuf::from(&positionals[2]),
+                driver_override: options.driver,
+                before_sha256: options.before_sha256,
+                after_sha256: options.after_sha256,
+            }))
+        }
+        "download" => Err("download requires CVE, NUMBER, and OUTPUT".into()),
         _ => Err(format!("unknown command `{command}`")),
     }
 }
@@ -104,7 +111,6 @@ fn parse_values(
     while let Some(value) = values.next() {
         let target = match value.as_str() {
             "--driver" => &mut options.driver,
-            "--before-kb" => &mut options.before_kb,
             "--before-sha256" => &mut options.before_sha256,
             "--after-sha256" => &mut options.after_sha256,
             unknown if unknown.starts_with('-') => {
@@ -152,13 +158,20 @@ fn run_info(cve_code: &str, driver_override: Option<&str>) -> ExitCode {
                 DriverOutcome::Unresolved { .. } => println!("driver: unresolved"),
             }
             println!("products:");
-            for patch in &metadata.catalog {
-                let before = if patch.before_kb.candidates().is_empty() {
-                    "?".into()
+            for (index, (patch, _)) in downloadable_patches(&metadata.catalog).enumerate() {
+                let details = if patch.update_kind.is_empty() {
+                    patch.architecture.clone()
                 } else {
-                    patch.before_kb.candidates().join("/")
+                    format!("{}, {}", patch.architecture, patch.update_kind)
                 };
-                println!("  {}: {} -> {}", patch.os_version, before, patch.after_kb);
+                println!(
+                    "  [{}] {} [{}]: {} -> {}",
+                    index + 1,
+                    patch.os_version,
+                    details,
+                    patch.before_kb,
+                    patch.after_kb
+                );
             }
             ExitCode::SUCCESS
         }
@@ -220,7 +233,7 @@ mod tests {
         let command = parse([
             "download".into(),
             "CVE-2026-1234".into(),
-            "Windows 11 x64".into(),
+            "2".into(),
             "out".into(),
             "--driver".into(),
             "clfs.sys".into(),
@@ -230,6 +243,35 @@ mod tests {
         let Command::Download(request) = command else {
             panic!("expected download command");
         };
+        assert_eq!(request.selection_number, 2);
         assert_eq!(request.driver_override.as_deref(), Some("clfs.sys"));
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_download_selection() {
+        let error = parse([
+            "download".into(),
+            "CVE-2026-1234".into(),
+            "Windows 11 x64".into(),
+            "out".into(),
+        ])
+        .err()
+        .expect("selection should be rejected");
+
+        assert_eq!(error, "download NUMBER must be a positive integer");
+    }
+
+    #[test]
+    fn rejects_download_selection_zero() {
+        let error = parse([
+            "download".into(),
+            "CVE-2026-1234".into(),
+            "0".into(),
+            "out".into(),
+        ])
+        .err()
+        .expect("selection should be rejected");
+
+        assert_eq!(error, "download NUMBER must be a positive integer");
     }
 }

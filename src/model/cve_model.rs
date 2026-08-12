@@ -1,35 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", content = "value", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum BeforeKb {
-    Available(String),
-    Missing,
-    Ambiguous(Vec<String>),
-}
-
-impl BeforeKb {
-    pub fn selected(&self) -> Option<&str> {
-        match self {
-            Self::Available(kb) => Some(kb),
-            Self::Missing | Self::Ambiguous(_) => None,
-        }
-    }
-
-    pub fn candidates(&self) -> &[String] {
-        match self {
-            Self::Available(kb) => std::slice::from_ref(kb),
-            Self::Ambiguous(candidates) => candidates,
-            Self::Missing => &[],
-        }
-    }
-}
-
+/// One exact MSRC supersedence edge for a product, architecture, and update channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductPatch {
+    pub product_id: u64,
     pub os_version: String,
-    pub before_kb: BeforeKb,
+    pub architecture: String,
+    pub update_kind: String,
+    pub before_kb: String,
     pub after_kb: String,
 }
 
@@ -69,17 +48,4 @@ pub struct MsrcRawData {
 pub struct MsrcFetchResult {
     pub raw: MsrcRawData,
     pub normalized: CveMetadata,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::BeforeKb;
-
-    #[test]
-    fn before_kb_encodes_selection_as_one_state() {
-        let ambiguous = BeforeKb::Ambiguous(vec!["KB1".into(), "KB2".into()]);
-
-        assert_eq!(ambiguous.selected(), None);
-        assert_eq!(ambiguous.candidates(), ["KB1", "KB2"]);
-    }
 }
