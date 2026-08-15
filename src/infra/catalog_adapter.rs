@@ -731,21 +731,11 @@ fn parse_detail(html: &str) -> Result<CatalogDetail, CatalogError> {
             reason: "detail page has no valid update ID".into(),
         });
     }
-    let architecture_text = element_text(html, "archDiv")
-        .unwrap_or_default()
-        .replace("Architecture:", "")
-        .trim()
-        .to_ascii_lowercase();
-    let architecture = if architecture_text.contains("arm64") {
-        Architecture::Arm64
-    } else if architecture_text.contains("amd64") || architecture_text.contains("x64") {
-        Architecture::X64
-    } else {
-        return Err(CatalogError::InvalidPayload {
+    let architecture =
+        architecture_from_title(&title).ok_or_else(|| CatalogError::InvalidPayload {
             stage: CatalogStage::Detail,
-            reason: format!("unsupported detail architecture {architecture_text:?}"),
-        });
-    };
+            reason: "detail title has no unambiguous supported architecture".into(),
+        })?;
     let products = element_text(html, "productsDiv")
         .unwrap_or_default()
         .replace("Supported products:", "")
@@ -821,38 +811,9 @@ fn parse_download_dialog(
         let url = fields.get("url").cloned().unwrap_or_default();
         let filename = fields.get("fileName").cloned().unwrap_or_default();
         validate_package_url(&url, &filename)?;
-        let sha1 = fields
-            .get("digest")
-            .filter(|value| !value.is_empty())
-            .map(|digest| {
-                BASE64
-                    .decode(digest)
-                    .map_err(|error| CatalogError::InvalidPayload {
-                        stage: CatalogStage::DownloadDialog,
-                        reason: format!("invalid package SHA-1: {error}"),
-                    })
-                    .and_then(|bytes| {
-                        if bytes.len() == 20 {
-                            Ok(hex(&bytes))
-                        } else {
-                            Err(CatalogError::InvalidPayload {
-                                stage: CatalogStage::DownloadDialog,
-                                reason: "package SHA-1 has an invalid length".into(),
-                            })
-                        }
-                    })
-            })
-            .transpose()?;
-        let sha256 = fields
-            .get("sha256")
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_ascii_lowercase());
-        if sha256.as_deref().is_some_and(|value| !is_sha256(value)) {
-            return Err(CatalogError::InvalidPayload {
-                stage: CatalogStage::DownloadDialog,
-                reason: "package SHA-256 is invalid".into(),
-            });
-        }
+        let sha1 = decode_package_digest(fields.get("digest").map(String::as_str), "SHA-1", 20)?;
+        let sha256 =
+            decode_package_digest(fields.get("sha256").map(String::as_str), "SHA-256", 32)?;
         packages.push(CatalogPackage {
             update_id: requested_id.to_ascii_lowercase(),
             url,
@@ -870,6 +831,29 @@ fn parse_download_dialog(
     Ok(packages)
 }
 
+fn decode_package_digest(
+    value: Option<&str>,
+    name: &str,
+    expected_length: usize,
+) -> Result<Option<String>, CatalogError> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let bytes = BASE64
+        .decode(value)
+        .map_err(|error| CatalogError::InvalidPayload {
+            stage: CatalogStage::DownloadDialog,
+            reason: format!("invalid package {name}: {error}"),
+        })?;
+    if bytes.len() != expected_length {
+        return Err(CatalogError::InvalidPayload {
+            stage: CatalogStage::DownloadDialog,
+            reason: format!("package {name} has an invalid length"),
+        });
+    }
+    Ok(Some(hex(&bytes)))
+}
+
 fn validate_package_url(value: &str, filename: &str) -> Result<(), CatalogError> {
     let url = Url::parse(value).map_err(|_| CatalogError::InvalidPayload {
         stage: CatalogStage::DownloadDialog,
@@ -881,6 +865,7 @@ fn validate_package_url(value: &str, filename: &str) -> Result<(), CatalogError>
             || host.ends_with(".download.windowsupdate.com")
             || host == "download.microsoft.com"
             || host.ends_with(".download.microsoft.com")
+            || host == "catalog.sf.dl.delivery.mp.microsoft.com"
     });
     let path_name = url
         .path_segments()
@@ -1493,9 +1478,14 @@ fn release_token(value: &str) -> Option<String> {
 }
 
 fn title_matches_architecture(title: &str, architecture: Architecture) -> bool {
-    match architecture {
-        Architecture::X64 => ARCH_X64.is_match(title),
-        Architecture::Arm64 => ARCH_ARM64.is_match(title),
+    architecture_from_title(title) == Some(architecture)
+}
+
+fn architecture_from_title(title: &str) -> Option<Architecture> {
+    match (ARCH_X64.is_match(title), ARCH_ARM64.is_match(title)) {
+        (true, false) => Some(Architecture::X64),
+        (false, true) => Some(Architecture::Arm64),
+        _ => None,
     }
 }
 
@@ -1561,7 +1551,7 @@ mod tests {
 
     use super::{
         apply_delta, hex, is_safe_delta_header, is_safe_forward_delta, parse_detail,
-        parse_download_dialog, select_update,
+        parse_download_dialog, select_update, validate_package_url,
     };
     use crate::model::{
         acquisition::Architecture,
@@ -1640,20 +1630,112 @@ mod tests {
     }
 
     #[test]
-    fn parses_text_after_a_nested_detail_label() {
+    fn derives_x64_detail_architecture_from_the_title_when_catalog_reports_na() {
         let html = concat!(
-            "<span id='ScopedViewHandler_titleText'>Update title</span>",
+            "<span id='ScopedViewHandler_titleText'>",
+            "2024-06 Cumulative Update for Windows 11 Version 22H2 ",
+            "for x64-based Systems (KB5039212)",
+            "</span>",
             "<span id='ScopedViewHandler_UpdateID'>11111111-1111-1111-1111-111111111111</span>",
-            "<div id='archDiv'><span>Architecture:</span> AMD64</div>",
+            "<div id='archDiv'><span>Architecture:</span> n/a</div>",
             "<div id='productsDiv'><span>Supported products:</span> Windows 11</div>",
-            "<div id='kbDiv'><span>KB article numbers:</span> 5017328</div>",
+            "<div id='kbDiv'><span>KB article numbers:</span> 5039212</div>",
         );
 
         let detail = parse_detail(html).unwrap();
 
         assert_eq!(detail.architecture, Architecture::X64);
         assert_eq!(detail.products, "Windows 11");
-        assert_eq!(detail.kb_numbers, ["KB5017328"]);
+        assert_eq!(detail.kb_numbers, ["KB5039212"]);
+    }
+
+    #[test]
+    fn derives_arm64_detail_architecture_from_the_title() {
+        let html = concat!(
+            "<span id='ScopedViewHandler_titleText'>",
+            "2024-06 Cumulative Update for Windows 11 Version 22H2 ",
+            "for ARM64-based Systems (KB5039212)",
+            "</span>",
+            "<span id='ScopedViewHandler_UpdateID'>11111111-1111-1111-1111-111111111111</span>",
+            "<div id='archDiv'><span>Architecture:</span> n/a</div>",
+        );
+
+        assert_eq!(
+            parse_detail(html).unwrap().architecture,
+            Architecture::Arm64
+        );
+    }
+
+    #[test]
+    fn rejects_detail_titles_without_one_supported_architecture() {
+        let detail = |title: &str| {
+            format!(
+                "<span id='ScopedViewHandler_titleText'>{title}</span>\
+                 <span id='ScopedViewHandler_UpdateID'>11111111-1111-1111-1111-111111111111</span>"
+            )
+        };
+
+        assert!(parse_detail(&detail("Cumulative Update (KB5000001)")).is_err());
+        assert!(
+            parse_detail(&detail(
+                "Cumulative Update for x64-based and ARM64-based Systems (KB5000001)"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_current_catalog_download_metadata() {
+        let html = concat!(
+            "downloadInformation[0].updateID = '15cddec9-ad48-4f0f-bc76-0f60359a5f6d';",
+            "downloadInformation[0].files[0].url = ",
+            "'https://catalog.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/",
+            "a2fe5398-6f24-46ee-a533-372dc30bfd82/public/",
+            "windows11.0-kb5039212-x64_2b67855a5e73c7a873e6bdca512c8c106b429196.msu';",
+            "downloadInformation[0].files[0].digest = 'K2eFWl5zx6hz5r3KUSyMEGtCkZY=';",
+            "downloadInformation[0].files[0].sha256 = ",
+            "'1Gk0YE41XqmsYfwRMPjQfOm5hZDqJoR/ivHhS4EYLzc=';",
+            "downloadInformation[0].files[0].fileName = ",
+            "'windows11.0-kb5039212-x64_2b67855a5e73c7a873e6bdca512c8c106b429196.msu';",
+        );
+
+        let package = parse_download_dialog(html, "15cddec9-ad48-4f0f-bc76-0f60359a5f6d")
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        assert_eq!(
+            package.sha1.as_deref(),
+            Some("2b67855a5e73c7a873e6bdca512c8c106b429196")
+        );
+        assert_eq!(
+            package.sha256.as_deref(),
+            Some("d46934604e355ea9ac61fc1130f8d07ce9b98590ea26847f8af1e14b81182f37")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_base64_catalog_sha256() {
+        let html = concat!(
+            "downloadInformation[0].updateID = '11111111-1111-1111-1111-111111111111';",
+            "downloadInformation[0].files[0].url = ",
+            "'https://catalog.sf.dl.delivery.mp.microsoft.com/files/file.msu';",
+            "downloadInformation[0].files[0].sha256 = 'not-base64';",
+            "downloadInformation[0].files[0].fileName = 'file.msu';",
+        );
+
+        assert!(parse_download_dialog(html, "11111111-1111-1111-1111-111111111111").is_err());
+    }
+
+    #[test]
+    fn rejects_catalog_cdn_lookalike_hosts() {
+        assert!(
+            validate_package_url(
+                "https://catalog.sf.dl.delivery.mp.microsoft.com.evil.example/file.msu",
+                "file.msu"
+            )
+            .is_err()
+        );
     }
 
     #[test]

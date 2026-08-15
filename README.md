@@ -55,16 +55,16 @@ Catalog fallback이 필요한지는 실행 전에 확정할 수 없으므로, `d
 
 ```bash
 curl -L \
-  https://github.com/developer-commit/fastoneday/releases/download/v0.2.0/fastoneday-v0.2.0-aarch64-apple-darwin \
+  https://github.com/developer-commit/fastoneday/releases/download/v0.3.0/fastoneday-v0.3.0-aarch64-apple-darwin \
   -o fastoneday
 chmod +x fastoneday
 ./fastoneday --help
 ```
 
-v0.2.0 바이너리의 SHA-256은 다음과 같습니다.
+v0.3.0 바이너리의 SHA-256은 다음과 같습니다.
 
 ```text
-74e96b945badb3a8abbeafe3790d0cfea51e3ced370c519bdaca77a41abeeeed
+1bce77ce67f5b488d74c22e2aedd16a8715945f9aabfffe84f07776a9e4f2e4b
 ```
 
 이 바이너리는 Apple의 공증을 받지 않았습니다. 운영체제 보안 정책으로 실행할 수 없는
@@ -107,9 +107,13 @@ fastoneday download \
 
 ```text
 output/
-├── before/clfs.sys
-└── after/clfs.sys
+├── before_KB5016629_clfs_Windows_11_version_21H2_for_x64_based_Systems.sys
+└── after_KB5017328_clfs_Windows_11_version_21H2_for_x64_based_Systems.sys
 ```
+
+파일명은 `{before|after}_{kb}_{driver_name}_{os_version}.extension` 형식입니다.
+`driver_name`은 확장자를 제외한 이름이며, `os_version`의 공백과 특수문자는 `_`로
+치환됩니다.
 
 전체 옵션은 다음 명령으로 확인합니다.
 

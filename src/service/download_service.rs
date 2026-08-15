@@ -76,6 +76,18 @@ impl<'a> DownloadService<'a> {
             select_product(&fetched.normalized.catalog, request.selection_number)?;
         let before_kb = patch.before_kb.clone();
         let after_kb = patch.after_kb.clone();
+        let before_destination = request.output_directory.join(output_filename(
+            "before",
+            &before_kb,
+            driver_name,
+            &patch.os_version,
+        ));
+        let after_destination = request.output_directory.join(output_filename(
+            "after",
+            &after_kb,
+            driver_name,
+            &patch.os_version,
+        ));
 
         let before = self.acquire(
             driver_name,
@@ -83,7 +95,7 @@ impl<'a> DownloadService<'a> {
             &patch.os_version,
             architecture,
             request.before_sha256.as_deref(),
-            request.output_directory.join("before").join(driver_name),
+            before_destination,
         )?;
         let after = self.acquire(
             driver_name,
@@ -91,7 +103,7 @@ impl<'a> DownloadService<'a> {
             &patch.os_version,
             architecture,
             request.after_sha256.as_deref(),
-            request.output_directory.join("after").join(driver_name),
+            after_destination,
         )?;
 
         Ok(ProductDownload {
@@ -195,6 +207,41 @@ fn select_product(
         })
 }
 
+fn output_filename(stage: &str, kb_code: &str, driver_name: &str, os_version: &str) -> String {
+    let (driver_stem, extension) = driver_name.rsplit_once('.').unwrap_or((driver_name, ""));
+    let os_version = filename_component(os_version);
+    let base = format!("{stage}_{kb_code}_{driver_stem}_{os_version}");
+    if extension.is_empty() {
+        base
+    } else {
+        format!("{base}.{extension}")
+    }
+}
+
+fn filename_component(value: &str) -> String {
+    let mut component = String::with_capacity(value.len());
+    let mut separated = true;
+
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            component.push(character);
+            separated = false;
+        } else if !separated {
+            component.push('_');
+            separated = true;
+        }
+    }
+
+    if component.ends_with('_') {
+        component.pop();
+    }
+    if component.is_empty() {
+        "unknown".into()
+    } else {
+        component
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +288,31 @@ mod tests {
         assert_eq!(selected.after_kb, "KB3");
         assert_eq!(architecture, Architecture::X64);
         assert!(select_product(&rows, 2).is_err());
+    }
+
+    #[test]
+    fn builds_flat_output_names_with_the_driver_extension_at_the_end() {
+        assert_eq!(
+            output_filename(
+                "before",
+                "KB5016629",
+                "clfs.sys",
+                "Windows 11 version 21H2 for x64-based Systems",
+            ),
+            "before_KB5016629_clfs_Windows_11_version_21H2_for_x64_based_Systems.sys"
+        );
+    }
+
+    #[test]
+    fn collapses_os_version_punctuation_into_single_underscores() {
+        assert_eq!(
+            output_filename(
+                "after",
+                "KB5017316",
+                "clfs.sys",
+                " Windows Server 2022, 23H2 Edition (Server Core installation) ",
+            ),
+            "after_KB5017316_clfs_Windows_Server_2022_23H2_Edition_Server_Core_installation.sys"
+        );
     }
 }

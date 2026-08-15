@@ -163,6 +163,7 @@ impl UupAdapter {
                 text(item, "title").is_some_and(|value| value.to_ascii_lowercase().contains(family))
             })
             .collect::<Vec<_>>();
+        let candidates = prefer_non_insider_builds(candidates);
         if candidates.len() != 1 {
             return Err(UupError::BuildSelection {
                 build: build_number.into(),
@@ -531,6 +532,22 @@ struct UupMedia {
     url: String,
 }
 
+fn prefer_non_insider_builds(candidates: Vec<&Map<String, Value>>) -> Vec<&Map<String, Value>> {
+    let non_insider = candidates
+        .iter()
+        .copied()
+        .filter(|item| {
+            text(item, "title")
+                .is_some_and(|title| !title.to_ascii_lowercase().contains("insider preview"))
+        })
+        .collect::<Vec<_>>();
+    if non_insider.is_empty() {
+        candidates
+    } else {
+        non_insider
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct BaseReference {
     base_sha256: String,
@@ -819,7 +836,9 @@ mod tests {
     use serde_json::json;
     use sha2::{Digest, Sha256};
 
-    use super::{UupAdapter, hex, load_reference, parse_component};
+    use super::{
+        UupAdapter, hex, load_reference, parse_component, prefer_non_insider_builds, text,
+    };
     use crate::model::acquisition::Architecture;
     use crate::port::UupPort;
 
@@ -832,6 +851,49 @@ mod tests {
         let parsed = parse_component(member, "example.sys", Architecture::X64).unwrap();
         assert_eq!(parsed.build, "26100.1");
         assert_eq!(parsed.baseline, "10.0.26100.1");
+    }
+
+    #[test]
+    fn prefers_the_retail_uup_build_but_keeps_a_lone_insider_rtm() {
+        let builds = json!([
+            {
+                "title": "Windows 11, version 22H2 (22621.1)",
+                "uuid": "retail"
+            },
+            {
+                "title": "Windows 11, version 22H2 Insider Preview 10.0.22621.1",
+                "uuid": "insider-one"
+            },
+            {
+                "title": "Windows 11 Insider Preview 22621.1",
+                "uuid": "insider-two"
+            }
+        ]);
+        let candidates = builds
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_object().unwrap())
+            .collect();
+        let selected = prefer_non_insider_builds(candidates);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(text(selected[0], "uuid"), Some("retail"));
+
+        let legacy = json!({
+            "title": "Windows 11 Insider Preview 10.0.22000.1",
+            "uuid": "legacy-insider"
+        });
+        let selected = prefer_non_insider_builds(vec![legacy.as_object().unwrap()]);
+        assert_eq!(text(selected[0], "uuid"), Some("legacy-insider"));
+
+        let retail_one = json!({"title": "Windows 11 (22621.1)", "uuid": "retail-one"});
+        let retail_two = json!({"title": "Windows 11 (22621.1)", "uuid": "retail-two"});
+        let selected = prefer_non_insider_builds(vec![
+            retail_one.as_object().unwrap(),
+            retail_two.as_object().unwrap(),
+        ]);
+        assert_eq!(selected.len(), 2);
     }
 
     #[test]
