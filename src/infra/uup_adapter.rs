@@ -27,6 +27,7 @@ use crate::{
 
 use super::{
     default_cache_directory, digest_file, format_bytes, hex, report_download_progress,
+    transfer_buffer,
     winbindex_adapter::{is_sha256, normalize_driver_name},
 };
 
@@ -306,7 +307,7 @@ impl UupAdapter {
         })?;
         let mut total = 0_u64;
         let mut next_percent = 0_u64;
-        let mut buffer = [0_u8; 1024 * 1024];
+        let mut buffer = transfer_buffer();
         if self.show_progress {
             report_download_progress("uup download", 0, media.size, &mut next_percent);
         }

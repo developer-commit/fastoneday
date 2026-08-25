@@ -20,6 +20,12 @@ pub use driver_adapter::DriverAdapter;
 pub use uup_adapter::UupAdapter;
 pub use winbindex_adapter::WinbindexAdapter;
 
+const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
+
+fn transfer_buffer() -> Vec<u8> {
+    vec![0_u8; TRANSFER_BUFFER_SIZE]
+}
+
 fn default_cache_directory() -> PathBuf {
     env::current_exe()
         .ok()
@@ -35,7 +41,7 @@ where
 {
     let mut file = File::open(path)?;
     let mut digest = D::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = transfer_buffer();
 
     loop {
         let count = file.read(&mut buffer)?;
@@ -89,8 +95,20 @@ fn report_download_progress(label: &str, received: u64, total: u64, next_percent
 
 #[cfg(test)]
 mod tests {
-    use super::{default_cache_directory, format_bytes};
-    use std::env;
+    use super::{TRANSFER_BUFFER_SIZE, default_cache_directory, format_bytes, transfer_buffer};
+    use std::{env, thread};
+
+    #[test]
+    fn transfer_buffer_does_not_require_a_megabyte_stack() {
+        let length = thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| transfer_buffer().len())
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(length, TRANSFER_BUFFER_SIZE);
+    }
 
     #[test]
     fn formats_download_sizes() {

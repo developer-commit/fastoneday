@@ -27,7 +27,7 @@ use crate::{
     port::WinbindexPort,
 };
 
-use super::{digest_file, hex};
+use super::{digest_file, hex, transfer_buffer};
 
 const X64_INDEX_ROOT: &str = "https://winbindex.m417z.com/data/by_filename_compressed";
 const ARM64_INDEX_ROOT: &str = "https://m417z.com/winbindex-data-arm64/by_filename_compressed";
@@ -223,7 +223,7 @@ impl WinbindexPort for WinbindexAdapter {
             })?;
         let mut digest = Sha256::new();
         let mut bytes_written = 0_u64;
-        let mut buffer = [0_u8; 1024 * 1024];
+        let mut buffer = transfer_buffer();
 
         loop {
             let count = response
