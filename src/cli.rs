@@ -2,7 +2,7 @@ use std::{env, path::PathBuf, process::ExitCode};
 
 use crate::{
     errors::{ClassifiedError, ErrorCode},
-    infra::{CatalogAdapter, CveAdapter, DriverAdapter, WinbindexAdapter},
+    infra::{CatalogAdapter, CveAdapter, DriverAdapter, UupAdapter, WinbindexAdapter},
     model::driver::DriverOutcome,
     service::{DownloadRequest, DownloadService, InfoService, ServiceError, downloadable_patches},
 };
@@ -184,7 +184,8 @@ fn run_download(request: &DownloadRequest) -> ExitCode {
     let driver = DriverAdapter;
     let winbindex = WinbindexAdapter::default();
     let catalog = CatalogAdapter::default().with_progress();
-    let service = DownloadService::new(&cve, &driver, &winbindex, &catalog);
+    let uup = UupAdapter::default().with_progress();
+    let service = DownloadService::new(&cve, &driver, &winbindex, &catalog).with_uup(&uup);
 
     match service.download(request) {
         Ok(result) => {

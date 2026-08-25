@@ -1,5 +1,7 @@
+use std::path::Path;
+
 use crate::{
-    errors::UupError,
+    errors::{UupError, UupStage},
     model::uup::{ResolvedBase, UupResolveRequest},
 };
 
@@ -11,4 +13,17 @@ pub trait UupPort: Send + Sync {
     fn resolve(&self, request: &UupResolveRequest) -> Result<ResolvedBase, UupError>;
 
     fn confirm(&self, candidate: &ResolvedBase) -> Result<(), UupError>;
+
+    fn acquire_exact(
+        &self,
+        request: &UupResolveRequest,
+        expected_sha256: &str,
+        destination: &Path,
+    ) -> Result<(ResolvedBase, bool), UupError> {
+        let _ = (request, expected_sha256, destination);
+        Err(UupError::InvalidPayload {
+            stage: UupStage::Cache,
+            reason: "exact UUP acquisition is not implemented by this adapter".into(),
+        })
+    }
 }

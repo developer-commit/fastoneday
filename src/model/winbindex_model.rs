@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::{acquisition::Architecture, catalog::CatalogRecoveryProvenance};
+use super::{
+    acquisition::Architecture, catalog::CatalogRecoveryProvenance, uup::UupBaseProvenance,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WinbindexResolveRequest {
@@ -21,6 +23,8 @@ pub struct WinbindexRecord {
     pub requested_os: String,
     pub matched_windows_version: String,
     pub matched_alias: String,
+    #[serde(default)]
+    pub component_member_path: Option<String>,
     pub architecture: Architecture,
     pub timestamp: u32,
     pub virtual_size: u64,
@@ -39,6 +43,10 @@ pub enum CatalogFallbackReason {
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum AcquisitionProvenance {
     SymbolServer,
+    UupBase {
+        fallback_reason: CatalogFallbackReason,
+        base: Box<UupBaseProvenance>,
+    },
     Catalog {
         fallback_reason: CatalogFallbackReason,
         recovery: Box<CatalogRecoveryProvenance>,

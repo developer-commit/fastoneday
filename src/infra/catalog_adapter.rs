@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::LazyLock,
+    thread,
     time::Duration,
 };
 
@@ -342,7 +343,7 @@ impl CatalogAdapter {
                 remediation: "install 7-Zip or set ONEDAY_7ZIP".into(),
             })?;
         let outer = work.join("outer");
-        extract_archive(&seven_zip, package, &outer)?;
+        extract_archive(&seven_zip, package, &outer, &[])?;
         if let Some(candidate) = find_exact_driver(&outer, request)? {
             return Ok((
                 candidate,
@@ -362,7 +363,7 @@ impl CatalogAdapter {
         cabs.sort();
         for (index, cab) in cabs.iter().enumerate() {
             let nested = work.join(format!("cab-{index:02}"));
-            extract_archive(&seven_zip, cab, &nested)?;
+            extract_archive(&seven_zip, cab, &nested, &[])?;
             if let Some(candidate) = find_exact_driver(&nested, request)? {
                 return Ok((
                     candidate,
@@ -376,6 +377,19 @@ impl CatalogAdapter {
                     },
                 ));
             }
+        }
+
+        let mut wims = collect_files(&outer)?
+            .into_iter()
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case("wim"))
+            })
+            .collect::<Vec<_>>();
+        wims.sort();
+        for (index, wim) in wims.iter().enumerate() {
+            let nested = work.join(format!("wim-{index:02}"));
+            extract_archive(&seven_zip, wim, &nested, &["express.psf.cix.xml"])?;
         }
 
         let payloads = discover_psf_payloads(work, request)?;
@@ -531,18 +545,29 @@ impl CatalogAdapter {
         query: &[(&str, &str)],
         stage: CatalogStage,
     ) -> Result<String, CatalogError> {
-        let response = self
-            .client
-            .get(url)
-            .query(query)
-            .timeout(self.request_timeout)
-            .send()
-            .map_err(|source| CatalogError::Network {
-                stage,
-                url: Some(url.into()),
-                source: Box::new(source),
-            })?;
-        response_text(response, stage, Some(url))
+        let retries = if stage == CatalogStage::Detail { 2 } else { 0 };
+        for attempt in 0..=retries {
+            let result = self
+                .client
+                .get(url)
+                .query(query)
+                .timeout(self.request_timeout)
+                .send()
+                .map_err(|source| CatalogError::Network {
+                    stage,
+                    url: Some(url.into()),
+                    source: Box::new(source),
+                })
+                .and_then(|response| response_text(response, stage, Some(url)));
+            match result {
+                Err(CatalogError::Network { .. }) if attempt < retries => {}
+                Err(CatalogError::Http { status_code, .. })
+                    if attempt < retries && (status_code == 429 || status_code >= 500) => {}
+                result => return result,
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        unreachable!("the bounded retry loop always returns")
     }
 }
 
@@ -1254,6 +1279,7 @@ fn extract_archive(
     executable: &Path,
     archive: &Path,
     destination: &Path,
+    members: &[&str],
 ) -> Result<(), CatalogError> {
     fs::create_dir_all(destination).map_err(|source| CatalogError::Publish {
         path: destination.to_owned(),
@@ -1264,6 +1290,7 @@ fn extract_archive(
         .arg("-y")
         .arg(format!("-o{}", destination.display()))
         .arg(archive)
+        .args(members)
         .output()
         .map_err(|_| CatalogError::ToolUnavailable {
             tool: executable.display().to_string(),

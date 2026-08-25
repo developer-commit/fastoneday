@@ -158,6 +158,19 @@ impl WinbindexPort for WinbindexAdapter {
         select_record(&records, request, architecture)
     }
 
+    fn resolve_predecessor(
+        &self,
+        request: &WinbindexResolveRequest,
+        successor_kb_code: &str,
+    ) -> Result<WinbindexRecord, WinbindexError> {
+        let architecture = request
+            .architecture
+            .map(Ok)
+            .unwrap_or_else(|| architecture_from_os(&request.os_version))?;
+        let records = self.fetch_index(&request.driver_name, architecture)?;
+        select_record_with_successor(&records, request, architecture, Some(successor_kb_code))
+    }
+
     fn download(
         &self,
         record: &WinbindexRecord,
@@ -303,18 +316,28 @@ impl WinbindexPort for WinbindexAdapter {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Candidate<'a> {
     score: usize,
     windows_version: &'a str,
     alias: &'a str,
     record: &'a Map<String, Value>,
+    component_member_path: Option<String>,
 }
 
 pub(crate) fn select_record(
     records: &Value,
     request: &WinbindexResolveRequest,
     architecture: Architecture,
+) -> Result<WinbindexRecord, WinbindexError> {
+    select_record_with_successor(records, request, architecture, None)
+}
+
+fn select_record_with_successor(
+    records: &Value,
+    request: &WinbindexResolveRequest,
+    architecture: Architecture,
+    successor_kb_code: Option<&str>,
 ) -> Result<WinbindexRecord, WinbindexError> {
     let records = records
         .as_object()
@@ -376,6 +399,7 @@ pub(crate) fn select_record(
                         windows_version,
                         alias,
                         record,
+                        component_member_path: None,
                     };
                     let replace =
                         candidates
@@ -399,6 +423,20 @@ pub(crate) fn select_record(
         }
     }
 
+    if candidates.is_empty()
+        && let Some(successor_kb_code) = successor_kb_code
+    {
+        let successor_kb_code = normalize_kb_code(successor_kb_code)?;
+        if let Some((sha256, candidate)) = inherited_base_candidate(
+            records,
+            &driver_name,
+            &target_os,
+            &successor_kb_code,
+            architecture,
+        ) {
+            candidates.insert(sha256, candidate);
+        }
+    }
     if candidates.is_empty() {
         return Err(WinbindexError::RecordNotFound {
             driver_name,
@@ -440,7 +478,7 @@ pub(crate) fn select_record(
             reason: format!("record key is not a SHA-256 digest: {sha256:?}"),
         });
     }
-    let selected = candidates[&sha256];
+    let selected = &candidates[&sha256];
     let file_info = object_or_empty(selected.record.get("fileInfo")).ok_or_else(|| {
         WinbindexError::InvalidPayload {
             stage: WinbindexStage::Selection,
@@ -467,12 +505,192 @@ pub(crate) fn select_record(
         requested_os: requested_os.into(),
         matched_windows_version: selected.windows_version.into(),
         matched_alias: selected.alias.into(),
+        component_member_path: selected.component_member_path.clone(),
         architecture,
         timestamp,
         virtual_size,
         index_url: index_url(&driver_name, architecture),
         download_url: symbol_url(&driver_name, timestamp, virtual_size),
     })
+}
+
+#[derive(Clone, Copy)]
+struct SuccessorCandidate<'a> {
+    score: usize,
+    windows_version: &'a str,
+    alias: &'a str,
+    update: &'a Map<String, Value>,
+}
+
+fn inherited_base_candidate<'a>(
+    records: &'a Map<String, Value>,
+    driver_name: &str,
+    target_os: &str,
+    successor_kb_code: &str,
+    architecture: Architecture,
+) -> Option<(String, Candidate<'a>)> {
+    let mut successors = BTreeMap::<String, SuccessorCandidate<'_>>::new();
+    for (raw_sha, raw_record) in records {
+        let record = raw_record.as_object()?;
+        let versions = object_or_empty(record.get("windowsVersions"))?;
+        for (windows_version, raw_updates) in versions {
+            let updates = raw_updates.as_object()?;
+            let update = updates.iter().find_map(|(kb, update)| {
+                (normalize_kb_code(kb).ok().as_deref() == Some(successor_kb_code))
+                    .then(|| update.as_object())
+                    .flatten()
+            });
+            let Some(update) = update else { continue };
+            for alias in expanded_aliases(windows_version, update).ok()? {
+                let score = alias_score(target_os, alias);
+                if score == 0 {
+                    continue;
+                }
+                let candidate = SuccessorCandidate {
+                    score,
+                    windows_version,
+                    alias,
+                    update,
+                };
+                let key = raw_sha.to_ascii_lowercase();
+                if successors.get(&key).is_none_or(|previous| {
+                    score > previous.score
+                        || (score == previous.score
+                            && (windows_version.as_str(), alias)
+                                < (previous.windows_version, previous.alias))
+                }) {
+                    successors.insert(key, candidate);
+                }
+            }
+        }
+    }
+
+    if successors.len() != 1 {
+        return None;
+    }
+    let (successor_sha256, successor) =
+        successors.iter().next().expect("one successor was checked");
+    if alias_score(target_os, successor.windows_version) < 10_000 {
+        return None;
+    }
+    let successor_date = release_date(successor.update)?;
+    let component_member_path = component_member_path(successor.update, driver_name, architecture)?;
+
+    let mut bases = BTreeMap::<String, &'a Map<String, Value>>::new();
+    let mut prior_hashes = Vec::new();
+    for (raw_sha, raw_record) in records {
+        let record = raw_record.as_object()?;
+        let versions = object_or_empty(record.get("windowsVersions"))?;
+        for (windows_version, raw_updates) in versions {
+            let updates = raw_updates.as_object()?;
+            for (raw_kb, raw_update) in updates {
+                let sha256 = raw_sha.to_ascii_lowercase();
+                if raw_kb.eq_ignore_ascii_case("BASE") {
+                    if alias_score(target_os, windows_version) >= 10_000 {
+                        bases.insert(sha256, record);
+                    }
+                    continue;
+                }
+                let update = raw_update.as_object()?;
+                let applies = expanded_aliases(windows_version, update)
+                    .ok()?
+                    .iter()
+                    .any(|alias| alias_score(target_os, alias) >= 10_000);
+                if !applies {
+                    continue;
+                }
+                let date = release_date(update)?;
+                if date < successor_date {
+                    prior_hashes.push(sha256);
+                } else if date == successor_date && &sha256 != successor_sha256 {
+                    return None;
+                }
+            }
+        }
+    }
+
+    if bases.len() != 1 {
+        return None;
+    }
+    let (base_sha256, base_record) = bases.into_iter().next().expect("one base was checked");
+    if prior_hashes.iter().any(|sha256| sha256 != &base_sha256) {
+        return None;
+    }
+    Some((
+        base_sha256,
+        Candidate {
+            score: successor.score,
+            windows_version: successor.windows_version,
+            alias: successor.alias,
+            record: base_record,
+            component_member_path: Some(component_member_path),
+        },
+    ))
+}
+
+fn release_date(update: &Map<String, Value>) -> Option<&str> {
+    let value = update
+        .get("updateInfo")?
+        .as_object()?
+        .get("releaseDate")?
+        .as_str()?;
+    let bytes = value.as_bytes();
+    (bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit()))
+    .then_some(value)
+}
+
+fn component_member_path(
+    update: &Map<String, Value>,
+    driver_name: &str,
+    architecture: Architecture,
+) -> Option<String> {
+    let assemblies = update.get("assemblies")?.as_object()?;
+    let expected_architecture: &[&str] = match architecture {
+        Architecture::X64 => &["amd64", "x64"],
+        Architecture::Arm64 => &["arm64", "aarch64"],
+    };
+    let mut paths = Vec::new();
+    for (name, raw_assembly) in assemblies {
+        let assembly = raw_assembly.as_object()?;
+        let identity = object_or_empty(assembly.get("assemblyIdentity"))?;
+        let matches_architecture = identity
+            .get("processorArchitecture")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                expected_architecture
+                    .iter()
+                    .any(|expected| value.eq_ignore_ascii_case(expected))
+            });
+        if !matches_architecture {
+            continue;
+        }
+        let attributes = assembly.get("attributes")?.as_array()?;
+        let contains_driver = attributes.iter().any(|raw_attribute| {
+            raw_attribute.as_object().is_some_and(|attribute| {
+                ["name", "sourceName"].iter().any(|field| {
+                    attribute
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value.eq_ignore_ascii_case(driver_name))
+                })
+            })
+        });
+        if contains_driver {
+            paths.push(format!(r"{name}\f\{driver_name}"));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    match paths.as_slice() {
+        [path] => Some(path.clone()),
+        _ => None,
+    }
 }
 
 pub(crate) fn normalize_driver_name(value: &str) -> Result<String, WinbindexError> {
@@ -662,7 +880,7 @@ fn validate_destination(destination: &Path) -> Result<(), WinbindexError> {
 mod tests {
     use serde_json::json;
 
-    use super::{architecture_from_os, select_record};
+    use super::{architecture_from_os, select_record, select_record_with_successor};
     use crate::model::{acquisition::Architecture, winbindex::WinbindexResolveRequest};
 
     #[test]
@@ -689,6 +907,106 @@ mod tests {
         let selected = select_record(&records, &request, Architecture::X64).unwrap();
         assert_eq!(selected.sha256, sha);
         assert_eq!(selected.matched_alias, "11-24H2");
+    }
+
+    #[test]
+    fn inherits_the_base_only_when_the_successor_is_the_first_file_change() {
+        let base_sha = "a".repeat(64);
+        let successor_sha = "b".repeat(64);
+        let assembly = "amd64_microsoft-windows-kernelstreaming_31bf3856ad364e35_10.0.22621.1848_none_373e89dd11989298";
+        let records = json!({
+            base_sha.clone(): {
+                "fileInfo": {"timestamp": 1, "virtualSize": 4096},
+                "windowsVersions": {
+                    "11-22H2": {"BASE": {}}
+                }
+            },
+            successor_sha: {
+                "fileInfo": {"timestamp": 2, "virtualSize": 4096},
+                "windowsVersions": {
+                    "11-22H2": {
+                        "KB5027231": {
+                            "updateInfo": {"releaseDate": "2023-06-13"},
+                            "assemblies": {
+                                assembly: {
+                                    "assemblyIdentity": {"processorArchitecture": "amd64"},
+                                    "attributes": [{"name": "mskssrv.sys"}]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let request = WinbindexResolveRequest {
+            driver_name: "mskssrv.sys".into(),
+            kb_code: "KB5026372".into(),
+            os_version: "Windows 11 Version 22H2 for x64-based Systems".into(),
+            architecture: Some(Architecture::X64),
+            selected_sha256: None,
+        };
+
+        let selected =
+            select_record_with_successor(&records, &request, Architecture::X64, Some("KB5027231"))
+                .unwrap();
+
+        assert_eq!(selected.sha256, base_sha);
+        assert_eq!(selected.kb_code, "KB5026372");
+        assert_eq!(
+            selected.component_member_path.as_deref(),
+            Some(
+                "amd64_microsoft-windows-kernelstreaming_31bf3856ad364e35_10.0.22621.1848_none_373e89dd11989298\\f\\mskssrv.sys"
+            )
+        );
+    }
+
+    #[test]
+    fn does_not_inherit_the_base_across_a_same_day_file_change() {
+        let records = json!({
+            "a".repeat(64): {
+                "fileInfo": {"timestamp": 1, "virtualSize": 4096},
+                "windowsVersions": {"11-22H2": {"BASE": {}}}
+            },
+            "b".repeat(64): {
+                "fileInfo": {"timestamp": 2, "virtualSize": 4096},
+                "windowsVersions": {
+                    "10-22H2": {
+                        "KB5026000": {"updateInfo": {
+                            "releaseDate": "2023-06-13",
+                            "otherWindowsVersions": ["11-22H2"]
+                        }}
+                    }
+                }
+            },
+            "c".repeat(64): {
+                "fileInfo": {"timestamp": 3, "virtualSize": 4096},
+                "windowsVersions": {
+                    "11-22H2": {
+                        "KB5027231": {
+                            "updateInfo": {"releaseDate": "2023-06-13"},
+                            "assemblies": {
+                                "amd64_component_31bf3856ad364e35_10.0.22621.1848_none_hash": {
+                                    "assemblyIdentity": {"processorArchitecture": "amd64"},
+                                    "attributes": [{"name": "mskssrv.sys"}]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let request = WinbindexResolveRequest {
+            driver_name: "mskssrv.sys".into(),
+            kb_code: "KB5026372".into(),
+            os_version: "Windows 11 Version 22H2 for x64-based Systems".into(),
+            architecture: Some(Architecture::X64),
+            selected_sha256: None,
+        };
+
+        assert!(
+            select_record_with_successor(&records, &request, Architecture::X64, Some("KB5027231"))
+                .is_err()
+        );
     }
 
     #[test]

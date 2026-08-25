@@ -14,6 +14,15 @@ pub trait WinbindexPort: Send + Sync {
     fn resolve(&self, request: &WinbindexResolveRequest)
     -> Result<WinbindexRecord, WinbindexError>;
 
+    fn resolve_predecessor(
+        &self,
+        request: &WinbindexResolveRequest,
+        successor_kb_code: &str,
+    ) -> Result<WinbindexRecord, WinbindexError> {
+        let _ = successor_kb_code;
+        self.resolve(request)
+    }
+
     fn download(
         &self,
         record: &WinbindexRecord,

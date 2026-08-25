@@ -509,6 +509,48 @@ impl UupPort for UupAdapter {
         })?;
         publish_bytes(&bytes, reference_path)
     }
+
+    fn acquire_exact(
+        &self,
+        request: &UupResolveRequest,
+        expected_sha256: &str,
+        destination: &Path,
+    ) -> Result<(ResolvedBase, bool), UupError> {
+        let expected_sha256 = expected_sha256.trim().to_ascii_lowercase();
+        if !is_sha256(&expected_sha256) {
+            return Err(UupError::InvalidPayload {
+                stage: UupStage::Cache,
+                reason: "expected SHA-256 is invalid".into(),
+            });
+        }
+
+        let resolved = self.resolve(request)?;
+        if resolved.sha256 != expected_sha256 {
+            return Err(UupError::HashMismatch {
+                path: resolved.path.clone(),
+                algorithm: HashAlgorithm::Sha256,
+                expected: expected_sha256,
+                actual: resolved.sha256.clone(),
+            });
+        }
+        let bytes = fs::read(&resolved.path).map_err(|source| UupError::Publish {
+            path: resolved.path.clone(),
+            source,
+        })?;
+        let actual = hex(&Sha256::digest(&bytes));
+        if actual != expected_sha256 {
+            return Err(UupError::HashMismatch {
+                path: resolved.path.clone(),
+                algorithm: HashAlgorithm::Sha256,
+                expected: expected_sha256,
+                actual,
+            });
+        }
+        self.confirm(&resolved)?;
+        let reused = destination.is_file();
+        publish_bytes(&bytes, destination)?;
+        Ok((resolved, reused))
+    }
 }
 
 #[derive(Debug)]

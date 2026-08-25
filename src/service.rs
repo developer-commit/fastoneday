@@ -4,7 +4,7 @@ mod info_service;
 use thiserror::Error;
 
 use crate::errors::{
-    CatalogError, ClassifiedError, CveError, DriverError, ErrorCode, WinbindexError,
+    CatalogError, ClassifiedError, CveError, DriverError, ErrorCode, UupError, WinbindexError,
 };
 use crate::model::{acquisition::Architecture, cve::ProductPatch};
 
@@ -37,6 +37,9 @@ pub enum ServiceError {
     #[error(transparent)]
     Catalog(#[from] CatalogError),
 
+    #[error(transparent)]
+    Uup(#[from] UupError),
+
     #[error("a driver must be selected for {cve_code}; candidates: {candidates:?}")]
     DriverNotConfirmed {
         cve_code: String,
@@ -57,6 +60,7 @@ impl ClassifiedError for ServiceError {
             Self::Driver(error) => error.code(),
             Self::Winbindex(error) => error.code(),
             Self::Catalog(error) => error.code(),
+            Self::Uup(error) => error.code(),
             Self::DriverNotConfirmed { candidates, .. } => {
                 if candidates.is_empty() {
                     ErrorCode::NotFound
@@ -74,6 +78,7 @@ impl ClassifiedError for ServiceError {
             Self::Driver(error) => error.retryable(),
             Self::Winbindex(error) => error.retryable(),
             Self::Catalog(error) => error.retryable(),
+            Self::Uup(error) => error.retryable(),
             Self::DriverNotConfirmed { .. } | Self::SelectionNumberOutOfRange { .. } => false,
         }
     }

@@ -49,26 +49,39 @@ Catalog fallback이 필요한지는 실행 전에 확정할 수 없으므로, `d
 
 ## 릴리스 바이너리
 
-현재 GitHub Release에서 제공하는 바이너리는 macOS 11 이상을 사용하는 Apple Silicon
-(`arm64`) Mac 전용입니다. Intel Mac, Linux, Windows에서는 소스에서 별도로 빌드해야
-합니다. 릴리스 바이너리에는 7-Zip이 포함되지 않습니다.
+현재 GitHub Release에서는 macOS 11 이상 Apple Silicon (`arm64`) 바이너리와
+Windows 10/11 x64 바이너리를 제공합니다. Intel Mac과 Linux에서는 소스에서 별도로
+빌드해야 합니다. 릴리스 바이너리에는 7-Zip이 포함되지 않습니다.
+
+macOS:
 
 ```bash
 curl -L \
-  https://github.com/developer-commit/fastoneday/releases/download/v0.3.0/fastoneday-v0.3.0-aarch64-apple-darwin \
+  https://github.com/developer-commit/fastoneday/releases/download/v0.4.0/fastoneday-v0.4.0-aarch64-apple-darwin \
   -o fastoneday
 chmod +x fastoneday
 ./fastoneday --help
 ```
 
-v0.3.0 바이너리의 SHA-256은 다음과 같습니다.
+Windows PowerShell:
 
-```text
-1bce77ce67f5b488d74c22e2aedd16a8715945f9aabfffe84f07776a9e4f2e4b
+```powershell
+Invoke-WebRequest `
+  https://github.com/developer-commit/fastoneday/releases/download/v0.4.0/fastoneday-v0.4.0-x86_64-pc-windows-gnu.exe `
+  -OutFile fastoneday.exe
+.\fastoneday.exe --help
 ```
 
-이 바이너리는 Apple의 공증을 받지 않았습니다. 운영체제 보안 정책으로 실행할 수 없는
-환경에서는 소스에서 직접 빌드하십시오.
+v0.4.0 바이너리의 SHA-256은 다음과 같습니다.
+
+```text
+c2a0f7211c38fa1541d6080a48d2eb1142d8fb19e5ef1e01391dfc3972b45813  fastoneday-v0.4.0-aarch64-apple-darwin
+5a9471cc9cef977dfddfeb920109aea05d5f0d2eb0725948c71db22ee027d790  fastoneday-v0.4.0-x86_64-pc-windows-gnu.exe
+```
+
+macOS 바이너리는 Apple 공증을 받지 않았고 Windows 바이너리도 코드 서명되지
+않았습니다. 운영체제 보안 정책으로 실행할 수 없는 환경에서는 소스에서 직접
+빌드하십시오.
 
 ## 빌드
 

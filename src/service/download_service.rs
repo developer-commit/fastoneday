@@ -12,7 +12,7 @@ use crate::{
             AcquisitionProvenance, CatalogFallbackReason, DownloadResult, WinbindexResolveRequest,
         },
     },
-    port::{CatalogPort, CvePort, DriverPort, WinbindexPort},
+    port::{CatalogPort, CvePort, DriverPort, UupPort, WinbindexPort},
 };
 
 use super::{ServiceError, downloadable_patches};
@@ -43,6 +43,7 @@ pub struct DownloadService<'a> {
     driver: &'a dyn DriverPort,
     winbindex: &'a dyn WinbindexPort,
     catalog: &'a dyn CatalogPort,
+    uup: Option<&'a dyn UupPort>,
 }
 
 impl<'a> DownloadService<'a> {
@@ -57,7 +58,13 @@ impl<'a> DownloadService<'a> {
             driver,
             winbindex,
             catalog,
+            uup: None,
         }
+    }
+
+    pub fn with_uup(mut self, uup: &'a dyn UupPort) -> Self {
+        self.uup = Some(uup);
+        self
     }
 
     pub fn download(&self, request: &DownloadRequest) -> Result<ProductDownload, ServiceError> {
@@ -90,19 +97,25 @@ impl<'a> DownloadService<'a> {
         ));
 
         let before = self.acquire(
-            driver_name,
-            &before_kb,
-            &patch.os_version,
-            architecture,
-            request.before_sha256.as_deref(),
+            WinbindexResolveRequest {
+                driver_name: driver_name.to_owned(),
+                kb_code: before_kb.clone(),
+                os_version: patch.os_version.clone(),
+                architecture: Some(architecture),
+                selected_sha256: request.before_sha256.clone(),
+            },
+            Some(&after_kb),
             before_destination,
         )?;
         let after = self.acquire(
-            driver_name,
-            &after_kb,
-            &patch.os_version,
-            architecture,
-            request.after_sha256.as_deref(),
+            WinbindexResolveRequest {
+                driver_name: driver_name.to_owned(),
+                kb_code: after_kb.clone(),
+                os_version: patch.os_version.clone(),
+                architecture: Some(architecture),
+                selected_sha256: request.after_sha256.clone(),
+            },
+            None,
             after_destination,
         )?;
 
@@ -119,20 +132,14 @@ impl<'a> DownloadService<'a> {
 
     fn acquire(
         &self,
-        driver_name: &str,
-        kb_code: &str,
-        os_version: &str,
-        architecture: Architecture,
-        selected_sha256: Option<&str>,
+        request: WinbindexResolveRequest,
+        successor_kb_code: Option<&str>,
         destination: PathBuf,
     ) -> Result<DownloadResult, ServiceError> {
-        let record = self.winbindex.resolve(&WinbindexResolveRequest {
-            driver_name: driver_name.to_owned(),
-            kb_code: kb_code.to_owned(),
-            os_version: os_version.to_owned(),
-            architecture: Some(architecture),
-            selected_sha256: selected_sha256.map(str::to_owned),
-        })?;
+        let record = match successor_kb_code {
+            Some(successor) => self.winbindex.resolve_predecessor(&request, successor)?,
+            None => self.winbindex.resolve(&request)?,
+        };
 
         match self.winbindex.download(&record, &destination) {
             Ok(download) => Ok(download),
@@ -145,20 +152,69 @@ impl<'a> DownloadService<'a> {
                     }
                     _ => unreachable!("the match arm restricts this variant"),
                 };
-                self.recover(record, destination, reason)
+                if record.component_member_path.is_some() && self.uup.is_some() {
+                    self.recover_base(record, destination, reason)
+                } else {
+                    self.recover(record, destination, reason)
+                }
             }
             Err(WinbindexError::Http {
                 status_code: status @ (404 | 410),
                 ..
-            }) => self.recover(
-                record,
-                destination,
-                CatalogFallbackReason::SymbolUnavailable {
+            }) => {
+                let reason = CatalogFallbackReason::SymbolUnavailable {
                     status_code: status,
-                },
-            ),
+                };
+                if record.component_member_path.is_some() && self.uup.is_some() {
+                    self.recover_base(record, destination, reason)
+                } else {
+                    self.recover(record, destination, reason)
+                }
+            }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn recover_base(
+        &self,
+        record: crate::model::winbindex::WinbindexRecord,
+        destination: PathBuf,
+        fallback_reason: CatalogFallbackReason,
+    ) -> Result<DownloadResult, ServiceError> {
+        let member_path = record
+            .component_member_path
+            .as_ref()
+            .expect("BASE recovery requires a component member path");
+        let uup = self.uup.expect("BASE recovery requires a UUP adapter");
+        let (resolved, reused) = uup.acquire_exact(
+            &crate::model::uup::UupResolveRequest {
+                driver_name: record.driver_name.clone(),
+                os_version: record.requested_os.clone(),
+                architecture: record.architecture,
+                member_path: member_path.clone(),
+            },
+            &record.sha256,
+            &destination,
+        )?;
+        let bytes_written = destination
+            .metadata()
+            .map_err(|source| crate::errors::UupError::Publish {
+                path: destination.clone(),
+                source,
+            })?
+            .len();
+        Ok(DownloadResult {
+            destination,
+            sha256: resolved.sha256,
+            source_url: resolved.provenance.media_source.clone(),
+            bytes_written,
+            reused,
+            record,
+            provenance: AcquisitionProvenance::UupBase {
+                fallback_reason,
+                base: Box::new(resolved.provenance),
+            },
+        })
     }
 
     fn recover(
