@@ -241,7 +241,7 @@ fn normalize_driver_name(value: &str) -> Result<String, DriverError> {
     let name = value.trim().to_ascii_lowercase();
     let bytes = name.as_bytes();
     let valid = bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-        && (bytes.ends_with(b".sys") || name == "ntosknl.exe")
+        && (bytes.ends_with(b".sys") || name == "ntoskrnl.exe")
         && bytes.iter().copied().all(is_filename_char);
 
     valid
@@ -402,8 +402,11 @@ mod tests {
     }
 
     #[test]
-    fn allows_ntosknl_exe_as_the_only_exe_exception() {
-        assert_eq!(normalize_driver_name("NtoSknl.EXE").unwrap(), "ntosknl.exe");
+    fn allows_ntoskrnl_exe_as_the_only_exe_exception() {
+        assert_eq!(
+            normalize_driver_name("NtoSkrnl.EXE").unwrap(),
+            "ntoskrnl.exe"
+        );
         assert!(normalize_driver_name("other.exe").is_err());
     }
 }
