@@ -697,7 +697,7 @@ pub(crate) fn normalize_driver_name(value: &str) -> Result<String, WinbindexErro
     let name = value.trim().to_ascii_lowercase();
     let bytes = name.as_bytes();
     let valid = bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes.ends_with(b".sys")
+        && (bytes.ends_with(b".sys") || name == "ntosknl.exe")
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
@@ -880,7 +880,9 @@ fn validate_destination(destination: &Path) -> Result<(), WinbindexError> {
 mod tests {
     use serde_json::json;
 
-    use super::{architecture_from_os, select_record, select_record_with_successor};
+    use super::{
+        architecture_from_os, normalize_driver_name, select_record, select_record_with_successor,
+    };
     use crate::model::{acquisition::Architecture, winbindex::WinbindexResolveRequest};
 
     #[test]
@@ -1014,5 +1016,11 @@ mod tests {
         assert!(
             architecture_from_os("Windows Server 2008 for 32-bit Systems Service Pack 2").is_err()
         );
+    }
+
+    #[test]
+    fn allows_ntosknl_exe_as_the_only_exe_exception() {
+        assert_eq!(normalize_driver_name("NtoSknl.EXE").unwrap(), "ntosknl.exe");
+        assert!(normalize_driver_name("other.exe").is_err());
     }
 }

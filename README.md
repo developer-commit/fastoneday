@@ -57,7 +57,7 @@ macOS:
 
 ```bash
 curl -L \
-  https://github.com/developer-commit/fastoneday/releases/download/v0.4.0/fastoneday-v0.4.0-aarch64-apple-darwin \
+  https://github.com/developer-commit/fastoneday/releases/download/v0.4.1/fastoneday-v0.4.1-aarch64-apple-darwin \
   -o fastoneday
 chmod +x fastoneday
 ./fastoneday --help
@@ -67,16 +67,16 @@ Windows PowerShell:
 
 ```powershell
 Invoke-WebRequest `
-  https://github.com/developer-commit/fastoneday/releases/download/v0.4.0/fastoneday-v0.4.0-x86_64-pc-windows-gnu.exe `
+  https://github.com/developer-commit/fastoneday/releases/download/v0.4.1/fastoneday-v0.4.1-x86_64-pc-windows-gnu.exe `
   -OutFile fastoneday.exe
 .\fastoneday.exe --help
 ```
 
-v0.4.0 바이너리의 SHA-256은 다음과 같습니다.
+v0.4.1 바이너리의 SHA-256은 다음과 같습니다.
 
 ```text
-c2a0f7211c38fa1541d6080a48d2eb1142d8fb19e5ef1e01391dfc3972b45813  fastoneday-v0.4.0-aarch64-apple-darwin
-5a9471cc9cef977dfddfeb920109aea05d5f0d2eb0725948c71db22ee027d790  fastoneday-v0.4.0-x86_64-pc-windows-gnu.exe
+7da1897046a06f39c3207dd91f0500e4271b12f1c1e3b3c39fd8614f8ff7c48b  fastoneday-v0.4.1-aarch64-apple-darwin
+0575fec1867ff9d8d4ab7395f12a0083d088fdfc6f9e4772944139854d63192b  fastoneday-v0.4.1-x86_64-pc-windows-gnu.exe
 ```
 
 macOS 바이너리는 Apple 공증을 받지 않았고 Windows 바이너리도 코드 서명되지
