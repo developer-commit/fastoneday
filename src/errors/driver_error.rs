@@ -4,7 +4,7 @@ use super::{ClassifiedError, ErrorCode};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DriverError {
-    #[error("driver name must be a plain .sys filename or ntoskrnl.exe: `{value}`")]
+    #[error("driver name must be a plain .sys, .exe, or .dll filename: `{value}`")]
     InvalidName { value: String },
 }
 
