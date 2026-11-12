@@ -1,0 +1,19 @@
+# Vendored copy of crates/lzms from https://github.com/jlevere/msdelta at
+# fb5ab88843e854f3fd32d553984d8685ae643913. Used by the vendored msdelta
+# decoder for LZMS-wrapped delta payloads (fastoneday itself decompresses
+# WIM LZMS with wimlib). Sources are unmodified; see ../README.md.
+[package]
+name = "lzms"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jlevere/msdelta"
+description = "Pure-Rust LZMS codec (vendored)."
+publish = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[dependencies]

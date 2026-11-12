@@ -1,6 +1,7 @@
 /target/
 /fastoneday-cache/
 /output/
+/fastoneday-workspace/
 
 .DS_Store
 .idea/

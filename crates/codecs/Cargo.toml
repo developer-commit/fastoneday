@@ -1,0 +1,18 @@
+[package]
+name = "fastoneday-codecs"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.88"
+# Our Rust code and C glue are MIT. The crate compiles in and statically
+# links libmspack's LZX decoder (LGPL-2.1) and wimlib's decompressors
+# (LGPL-2.1-or-later, one file MIT); see ../../third_party/README.md.
+license = "MIT AND LGPL-2.1-only AND LGPL-2.1-or-later"
+description = "Safe Rust API over libmspack's LZX and wimlib's LZMS/LZX/XPRESS decompressors, built from vendored sources"
+publish = false
+links = "fastoneday_codecs"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+lzms = { path = "../../third_party/lzms" }

@@ -1,0 +1,496 @@
+//! Decompression internals for the PseudoLzx codec.
+
+use crate::bitstream::BitReader;
+use crate::huffman::HuffmanTable;
+use crate::{Error, Result};
+
+use super::format::{CompositeFormat, SegmentTables, PRETREE_SYMBOLS, TOTAL_LENGTHS};
+use super::format::{LRU_BASE, SOURCE_COPY};
+use super::ops::{OFFSET_BIAS, RAW_OFFSET_BASE};
+use super::rift;
+
+pub(super) fn read_composite_format(reader: &mut BitReader) -> Result<CompositeFormat> {
+    let num_segments = reader.read_i64()? as usize;
+    if num_segments == 0 || num_segments > 1024 {
+        return Err(Error::Malformed("invalid segment count"));
+    }
+
+    let mut boundaries = Vec::with_capacity(num_segments);
+    let mut acc = 0i64;
+    for _ in 0..num_segments {
+        let delta = reader.read_i64()?;
+        // Attacker-controlled deltas can overflow the accumulator; a valid
+        // boundary sequence stays within the output size, so treat overflow
+        // as malformed rather than wrapping into a bogus position.
+        acc = acc
+            .checked_add(delta)
+            .ok_or(Error::Malformed("segment boundary overflow"))?;
+        boundaries.push(acc as u64);
+    }
+
+    // Read pre-tree: 39 symbols, each with a 4-bit code length
+    let mut pretree_lengths = [0u8; PRETREE_SYMBOLS];
+    for l in &mut pretree_lengths {
+        *l = reader.read_bits(4)? as u8;
+    }
+    let pretree = HuffmanTable::from_lengths(&pretree_lengths)?;
+
+    // Previous lengths start as all zeros (Reset(true) in the decompiled code).
+    // The flat code is only used for simple mode.
+    let mut prev_lengths = vec![0u8; TOTAL_LENGTHS];
+
+    let mut segments = Vec::with_capacity(num_segments);
+    for _ in 0..num_segments {
+        let lengths = read_compression_lengths(reader, &pretree, &prev_lengths)?;
+        let tables = SegmentTables::from_lengths(&lengths)?;
+        prev_lengths = lengths;
+        segments.push(tables);
+    }
+
+    if std::env::var("LZX_SEG_DEBUG").is_ok() {
+        eprintln!("LZX: {num_segments} segments, boundaries={boundaries:?}");
+    }
+    Ok(CompositeFormat {
+        segments,
+        boundaries,
+    })
+}
+
+/// Read 872 delta-encoded compression lengths using the pre-tree.
+///
+/// Pre-tree symbol meanings (from CompressionLengths::Read):
+/// 0-16:   raw code length
+/// 17-19:  increment from previous (+1, +2, +3)
+/// 20-22:  decrement from previous (-1, -2, -3)
+/// 23+:    run-length with variable count
+pub(super) fn read_compression_lengths(
+    reader: &mut BitReader,
+    pretree: &HuffmanTable,
+    prev: &[u8],
+) -> Result<Vec<u8>> {
+    let mut result = vec![0u8; TOTAL_LENGTHS];
+    let mut i = 0;
+
+    while i < TOTAL_LENGTHS {
+        let sym = pretree.read_symbol(reader)? as u32;
+
+        if sym <= 16 {
+            result[i] = sym as u8;
+            i += 1;
+        } else if sym < 23 {
+            // Delta from previous
+            let delta = sym - 17;
+            let new_len = if delta < 3 {
+                prev[i].wrapping_add(delta as u8 + 1)
+            } else {
+                prev[i].wrapping_sub(delta as u8 - 2)
+            };
+            result[i] = new_len;
+            i += 1;
+        } else {
+            // Run-length
+            let run_sym = sym - 23;
+            let run_slot = run_sym & 7;
+            let run_count = if run_slot < 3 {
+                (run_slot + 1) as usize
+            } else {
+                let extra_bits = run_slot - 1;
+                let extra = reader.read_bits(extra_bits)? as u32;
+                let count = (1u32 << extra_bits) | extra;
+                count as usize
+            };
+
+            if i + run_count > TOTAL_LENGTHS {
+                return Err(Error::Malformed("run-length exceeds total lengths"));
+            }
+
+            let fill_value = if run_sym < 8 {
+                if i == 0 {
+                    return Err(Error::Malformed("run-length at start of lengths"));
+                }
+                result[i - 1]
+            } else {
+                prev[i]
+            };
+
+            for j in 0..run_count {
+                let src = if run_sym >= 8 {
+                    prev[i + j]
+                } else {
+                    fill_value
+                };
+                result[i + j] = src;
+            }
+            i += run_count;
+        }
+    }
+
+    for &l in &result {
+        if l > 16 {
+            return Err(Error::Malformed("code length exceeds maximum"));
+        }
+    }
+
+    Ok(result)
+}
+
+/// Core decompression implementation shared by `decompress` and `decompress_partial`.
+///
+/// When `copy_src` is `Some`, it is filled in lockstep with `output`: one
+/// `i64` per output byte giving the **reference offset** the byte was copied
+/// from, or `-1` for a literal supplied by the patch. Bytes copied from the
+/// already-reconstructed `output` (LZ back-references) inherit the copy-source
+/// of the region they copy, so the reference provenance propagates through
+/// back-references. This both flags copied-from-reference bytes (`>= 0`) -- the
+/// genuine "transform marker" gate -- and, by inverting against a known target,
+/// reconstructs genuine's transformed source `T(source)` at every copied offset.
+/// Copy `len` bytes into `output` for one match at output position `dst_pos`
+/// with `distance` (source = dst_pos - distance). The source range may lie in
+/// the reference (`< ref_len`), in the already-decoded output (`>= ref_len`,
+/// possibly overlapping), or span the boundary. `copy_src` (when present)
+/// records each byte's reference provenance. The caller advances its position by
+/// `len`. Shared by the fixed-distance path and the SOURCE_COPY rift-segment walk.
+fn copy_one(
+    output: &mut Vec<u8>,
+    mut copy_src: Option<&mut Vec<i64>>,
+    reference: &[u8],
+    ref_len: u64,
+    dst_pos: u64,
+    distance: i64,
+    len: u64,
+) -> Result<()> {
+    let src_start = (dst_pos as i64 - distance) as u64;
+    if src_start.checked_add(len).is_some_and(|e| e <= ref_len) {
+        // Entirely from the reference.
+        let s = src_start as usize;
+        let e = s + len as usize;
+        if e > reference.len() {
+            return Err(Error::Malformed("source copy out of reference bounds"));
+        }
+        output.extend_from_slice(&reference[s..e]);
+        if let Some(p) = copy_src.as_deref_mut() {
+            p.extend((s..e).map(|x| x as i64));
+        }
+    } else if src_start >= ref_len {
+        // Entirely from the output (LZ back-reference; may overlap).
+        let out_start = (src_start - ref_len) as usize;
+        if out_start >= output.len() {
+            return Err(Error::Malformed("back-reference out of output bounds"));
+        }
+        if out_start + len as usize <= output.len() {
+            output.extend_from_within(out_start..out_start + len as usize);
+            if let Some(p) = copy_src.as_deref_mut() {
+                p.extend_from_within(out_start..out_start + len as usize);
+            }
+        } else {
+            for k in 0..len as usize {
+                let idx = out_start + k;
+                let byte = output[idx];
+                output.push(byte);
+                if let Some(p) = copy_src.as_deref_mut() {
+                    p.push(p[idx]);
+                }
+            }
+        }
+    } else {
+        // Spans the reference/output boundary -- split.
+        let ref_bytes = (ref_len - src_start) as usize;
+        let out_bytes = len as usize - ref_bytes;
+        output.extend_from_slice(&reference[src_start as usize..ref_len as usize]);
+        if let Some(p) = copy_src.as_deref_mut() {
+            p.extend((src_start as usize..ref_len as usize).map(|x| x as i64));
+        }
+        for i in 0..out_bytes {
+            if i >= output.len() {
+                return Err(Error::Malformed("back-reference out of output bounds"));
+            }
+            output.push(output[i]);
+            if let Some(p) = copy_src.as_deref_mut() {
+                p.push(p[i]);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn decompress_into(
+    reference: &[u8],
+    patch_data: &[u8],
+    target_size: usize,
+    caller_rift: Option<&rift::RiftTable>,
+    output: &mut Vec<u8>,
+    mut copy_src: Option<&mut Vec<i64>>,
+) -> Result<()> {
+    if patch_data.is_empty() {
+        return if target_size == 0 {
+            Ok(())
+        } else {
+            Err(Error::Malformed("empty patch data for non-zero target"))
+        };
+    }
+
+    let mut reader = BitReader::new(patch_data)?;
+
+    let mut rift_table = rift::RiftTable::from_reader(&mut reader)?;
+
+    // Merge with caller-provided rift (from PE preprocessing)
+    if let Some(cr) = caller_rift {
+        for e in &cr.entries {
+            rift_table.entries.push(*e);
+        }
+    }
+
+    // Add boundary entry at source_size (as ApplyForward does in msdelta.dll)
+    let ref_len = reference.len();
+    rift_table.entries.push(rift::RiftEntry {
+        source: ref_len as i64,
+        target: 0,
+    });
+    rift_table.entries.sort_by_key(|e| e.source);
+    let ort = rift::OffsetRiftTable::from_rift_table(&rift_table);
+
+    let cf_simple = reader.read_bits(1)? != 0;
+    let format = if cf_simple {
+        CompositeFormat {
+            segments: vec![SegmentTables::from_flat()?],
+            boundaries: vec![u64::MAX],
+        }
+    } else {
+        read_composite_format(&mut reader)?
+    };
+
+    let mut seg_idx = 0;
+    output.reserve(target_size);
+    if let Some(p) = copy_src.as_deref_mut() {
+        p.reserve(target_size);
+    }
+    let mut lru: [i64; 3] = [0; 3];
+    let mut pos: u64 = ref_len as u64;
+    let end: u64 = pos + target_size as u64;
+
+    while pos < end {
+        if reader.remaining() == 0 {
+            return Err(Error::Malformed("bitstream exhausted before target filled"));
+        }
+
+        while seg_idx + 1 < format.segments.len()
+            && format
+                .boundaries
+                .get(seg_idx + 1)
+                .is_some_and(|&b| pos >= b)
+        {
+            seg_idx += 1;
+        }
+        let tables = &format.segments[seg_idx];
+
+        let (raw_offset, match_len) = read_symbol(tables, &mut reader)?;
+
+        if match_len == 1 && raw_offset < 256 {
+            output.push(raw_offset as u8);
+            if let Some(p) = copy_src.as_deref_mut() {
+                p.push(-1);
+            }
+            pos += 1;
+            continue;
+        }
+        let copy_len = (match_len as u64).min(end - pos);
+
+        let rift_offset = ort.offset_at(pos as i64);
+        let distance: i64;
+        if raw_offset == SOURCE_COPY {
+            distance = -rift_offset;
+        } else if raw_offset < SOURCE_COPY {
+            distance = raw_offset as i64 - OFFSET_BIAS as i64 - rift_offset;
+        } else if (LRU_BASE..LRU_BASE + 3).contains(&raw_offset) {
+            distance = lru[(raw_offset - LRU_BASE) as usize];
+        } else {
+            distance = (raw_offset - RAW_OFFSET_BASE) as i64;
+        }
+
+        // LRU update runs for ALL match types (decompiled Run's LAB_1800278aa).
+        if lru[0] != distance {
+            let old_1 = lru[1];
+            lru[1] = lru[0];
+            lru[0] = distance;
+            if old_1 != distance {
+                lru[2] = old_1;
+            }
+        }
+
+        // SOURCE_COPY re-anchors at every rift breakpoint WITHIN the copy:
+        // genuine `Decompressor::Run` (the 0x54000 case) walks rift segments,
+        // setting source = output_pos + segment_offset and jumping to the next
+        // segment when its breakpoint falls inside the copy. A flat fixed-distance
+        // copy is wrong whenever a SOURCE copy spans a breakpoint (e.g. docprop
+        // .idata). Other distance classes use a fixed distance (no rift walk).
+        if raw_offset == SOURCE_COPY {
+            // Re-anchor the source at every rift breakpoint inside the copy: per
+            // segment, source = output_pos + segment_offset (distance = -offset).
+            let mut remaining = copy_len;
+            let mut p = pos;
+            while remaining > 0 {
+                let (seg_off, next_bp) = ort.segment_at(p as i64);
+                let avail = (next_bp as u64).saturating_sub(p).max(1);
+                let chunk = remaining.min(avail);
+                copy_one(
+                    &mut *output,
+                    copy_src.as_deref_mut(),
+                    reference,
+                    ref_len as u64,
+                    p,
+                    -seg_off,
+                    chunk,
+                )?;
+                p += chunk;
+                remaining -= chunk;
+            }
+            pos += copy_len;
+            continue;
+        }
+
+        copy_one(
+            &mut *output,
+            copy_src.as_deref_mut(),
+            reference,
+            ref_len as u64,
+            pos,
+            distance,
+            copy_len,
+        )?;
+        pos += copy_len;
+    }
+
+    if output.len() != target_size {
+        return Err(Error::Malformed("output size mismatch"));
+    }
+
+    Ok(())
+}
+
+/// Read one symbol, returning (raw_offset, length).
+/// For literals: (byte_value, 1).
+/// For matches: (encoded_offset, match_length).
+#[inline]
+pub(super) fn read_symbol(tables: &SegmentTables, reader: &mut BitReader) -> Result<(u32, u32)> {
+    let raw = tables.main.read_symbol(reader)?;
+
+    if raw < 0x100 {
+        return Ok((raw as u32, 1));
+    }
+    let idx = (raw - 0x100) as u32;
+    let length_slot = idx & 7;
+    let offset_slot = idx >> 3;
+
+    let offset = decode_offset(offset_slot, tables, reader)?;
+
+    let length = if length_slot == 0 {
+        let len_sym = tables.lengths.read_symbol(reader)?;
+        if len_sym == 0 {
+            let big_len = reader.read_u32_number()?;
+            if big_len < 256 {
+                return Err(Error::Malformed("ReadNumber returned value < 256"));
+            }
+            // Crafted input can set big_len near u32::MAX; the +7 (and the +1
+            // below) would overflow. Such a length is never valid (output is
+            // size-bounded), so report malformed rather than wrapping.
+            big_len
+                .checked_add(7)
+                .ok_or(Error::Malformed("LZX match length overflow"))?
+        } else {
+            len_sym as u32 + 7
+        }
+    } else {
+        length_slot
+    };
+
+    let length = length
+        .checked_add(1)
+        .ok_or(Error::Malformed("LZX match length overflow"))?;
+    Ok((offset, length))
+}
+
+#[inline]
+fn decode_offset(slot: u32, tables: &SegmentTables, reader: &mut BitReader) -> Result<u32> {
+    if slot < 3 {
+        let adjusted = match slot {
+            0 => {
+                let raw = reader.read_bits(14)? as i32;
+                (raw & 0x3FFF) - 0x2000
+            }
+            1 => {
+                let raw = reader.read_bits(16)? as u32;
+                if raw < 0x8000 {
+                    raw as i32 - 0xA000i32
+                } else {
+                    raw as i32 - 0x6000i32
+                }
+            }
+            2 => {
+                let raw = reader.read_bits(18)? as u32;
+                if raw >= 0x20000 {
+                    raw as i32 - 0x16000i32
+                } else {
+                    raw as i32 - 0x2A000i32
+                }
+            }
+            _ => unreachable!(),
+        };
+        Ok((adjusted + OFFSET_BIAS as i32) as u32)
+    } else if slot < 7 {
+        Ok(slot + 0x53FFD)
+    } else {
+        let adj_slot = slot - 7;
+        let extra_val = decode_extra_value(adj_slot, reader)?;
+
+        if extra_val > 63 {
+            return Err(Error::Malformed("offset extra value too large"));
+        }
+
+        let dist = if extra_val <= 3 {
+            extra_val
+        } else {
+            let base = ((extra_val & 1) + 2) as u32;
+            let half = (extra_val >> 1) - 1;
+
+            if half < 4 {
+                let shifted = base << half;
+                let extra = if half == 0 {
+                    0
+                } else {
+                    reader.read_bits(half)? as u32
+                };
+                shifted | extra
+            } else {
+                let high_bits = half - 4;
+                let mut val = base;
+                if high_bits > 0 {
+                    let extra = reader.read_bits(high_bits)? as u32;
+                    val = (val << high_bits) | extra;
+                }
+                let aligned = tables.aligned.read_symbol(reader)? as u32;
+                (val << 4) | aligned
+            }
+        };
+
+        dist.checked_add(RAW_OFFSET_BASE)
+            .ok_or(Error::Malformed("LZX offset overflow"))
+    }
+}
+
+#[inline]
+fn decode_extra_value(adj_slot: u32, reader: &mut BitReader) -> Result<u32> {
+    if adj_slot != 0 {
+        return Ok(adj_slot);
+    }
+    let result = if reader.read_bits(1)? == 0 {
+        let val = reader.read_bits(2)? as u32;
+        val + 0x24
+    } else if reader.read_bits(1)? == 0 {
+        let val = reader.read_bits(3)? as u32;
+        val + 4 + 0x24
+    } else {
+        let val = reader.read_bits(4)? as u32;
+        val + 8 + 4 + 0x24
+    };
+    Ok(result)
+}

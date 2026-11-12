@@ -1,21 +1,52 @@
 [package]
 name = "fastoneday"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Terminal UI that fetches exact before/after Microsoft binaries for a CVE so they can be patch-diffed"
+license = "MIT"
+
+[[bin]]
+name = "fastoneday"
+path = "src/main.rs"
+
+[workspace]
+# The root package is a member implicitly. Listing "." here would make every
+# path below the root an explicit member and defeat `exclude`.
+members = ["crates/codecs"]
+# Vendored upstream code is built as path dependencies but kept out of the
+# workspace (its own tests and lints are upstream's business).
+exclude = ["third_party"]
 
 [dependencies]
 base64 = "0.22"
-flate2 = "1.1"
-# Audited and pinned as a library-only decoder; CLI and WinSxS features stay disabled.
-msdelta = { git = "https://github.com/jlevere/msdelta.git", rev = "fb5ab88843e854f3fd32d553984d8685ae643913", default-features = false }
-regex = "1.13"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-roxmltree = "0.20"
+cfb = "0.10"
+# libmspack (LZX) and wimlib (LZMS/LZX/XPRESS) decompressors, compiled from
+# the vendored C sources in third_party/ (LGPL; see third_party/README.md).
+fastoneday-codecs = { path = "crates/codecs" }
+# MSZIP (deflate) stays on miniz_oxide, the most widely deployed deflate
+# implementation in Rust.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+md-5 = "0.10"
+# Portable MSDelta (PA19/PA30/PA31) decoder, vendored from jlevere/msdelta.
+# On Windows the official system DLL is preferred (see src/delta_engine).
+msdelta = { path = "third_party/msdelta" }
+quick-xml = "0.41"
+ratatui = "0.30"
+regex = "1.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
-tempfile = "3.27"
-thiserror = "2.0.20"
-time = { version = "0.3", features = ["formatting"] }
-url = "2.5"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+ureq = "3"
+
+[dev-dependencies]
+# Independent LZMS encoder, used to produce test inputs for wimlib.
+lzms = { path = "third_party/lzms" }
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
