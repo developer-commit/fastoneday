@@ -12,8 +12,11 @@ use std::{
 
 use crate::{
     acquire::{Progress, Step},
-    app::{Services, acquire_case, acquire_case_with_fallback, load_cve, package_names},
-    domain::{BinaryName, CveId},
+    app::{
+        Comparison, CveReport, Listing, PairListing, Services, acquire_case,
+        acquire_case_with_fallback, compare_pair, list_pair, load_cve,
+    },
+    domain::{BinaryName, Change, CveId, Evidence, PatchPair},
     error::{Error, Result},
     io::{Cancel, Meter},
 };
@@ -43,47 +46,96 @@ pub fn run(services: Arc<Services>, args: FetchArgs) -> Result<()> {
             ""
         }
     );
-    println!("products:");
+    println!("patch pairs (update replaced → update with the fix):");
     for (i, pair) in detail.patches.iter().enumerate() {
         println!(
-            "  [{}] {:<44} {} → {}  ({})",
-            i + 1,
-            pair.short_product(),
+            " {}{:<5} {:<36} {} → {}  {}",
+            if i == 0 { "★" } else { " " },
+            format!("[{}]", i + 1),
+            pair.label(),
             pair.before,
             pair.after,
-            pair.kind
+            pair.fixed_build.as_deref().unwrap_or(&pair.kind)
         );
     }
-    for skipped in &detail.unsupported {
-        println!("  (skipped) {skipped}");
+    if detail.patches.is_empty() {
+        println!("  (none can be fetched)");
     }
-    println!("binary candidates:");
-    for c in report.candidates.iter().take(8) {
-        let why: Vec<String> = c.evidence.iter().map(|e| e.label()).collect();
-        println!("  {:<24} {:>3}  {}", c.name, c.score, why.join(", "));
+    if !detail.unsupported.is_empty() {
+        println!("not fetchable:");
+        for skipped in &detail.unsupported {
+            println!("  · {skipped}");
+        }
     }
-    if args.list_only {
-        return Ok(());
+    if detail.patches.is_empty() {
+        if args.list_only {
+            return Ok(());
+        }
+        return Err(Error::Unsupported(format!(
+            "none of the products affected by {cve} can be fetched (reasons above)"
+        )));
     }
-
     let index = args.product.unwrap_or(1);
     let pair = detail
         .patches
         .get(index.wrapping_sub(1))
         .cloned()
-        .ok_or_else(|| Error::Input(format!("product [{index}] does not exist")))?;
+        .ok_or_else(|| {
+            Error::Input(format!(
+                "patch pair [{index}] does not exist; pick 1 to {}",
+                detail.patches.len()
+            ))
+        })?;
     let progress = TextProgress::default();
     let cancel = Cancel::new();
+
+    // The binary comes from this pair's fixing update: list its files
+    // (downloading the package only when fetching needs it anyway).
+    println!(
+        "binaries of [{index}] {} — files of {}:",
+        pair.label(),
+        pair.after
+    );
+    let listed = list_pair(
+        &services,
+        &report,
+        &pair,
+        !args.list_only,
+        &progress,
+        &cancel,
+    );
+    let listing = match listed {
+        Ok(Listing::Ready(mut listing)) => {
+            compare_pair(&services, &report, &pair, &mut listing, &progress, &cancel)?;
+            print_listing(&pair, &listing);
+            Some(listing)
+        }
+        Ok(Listing::NeedsDownload { package, size }) => {
+            let size = size
+                .map(|s| format!(", {:.0} MB", s as f64 / 1048576.0))
+                .unwrap_or_default();
+            println!(
+                "  listed only inside its package ({package}{size}); run without --list to download it (cached) and pick from it"
+            );
+            print_hints(&report);
+            None
+        }
+        Err(e) if args.binary.is_some() && !matches!(e, Error::Cancelled) => {
+            println!("  file list unavailable: {e}");
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    if args.list_only {
+        return Ok(());
+    }
     let binary = match args.binary {
         Some(name) => BinaryName::parse(&name)?,
-        None => {
-            let refined = package_names(&services, &report, &pair, &progress, &cancel)?
-                .map(|(_, candidates)| candidates)
-                .unwrap_or_else(|| report.candidates.clone());
-            refined.first().map(|c| c.name.clone()).ok_or_else(|| {
-                Error::Input("no binary could be inferred; pass --binary NAME".into())
-            })?
-        }
+        None => listing
+            .as_ref()
+            .and_then(|l| l.pick())
+            .map(|c| c.name.clone())
+            .ok_or_else(|| Error::Input(no_pick(&pair, listing.as_ref())))?,
     };
     eprintln!("Fetching {binary} for {} …", pair.short_product());
     let result = if args.product.is_some() {
@@ -103,6 +155,87 @@ pub fn run(services: Arc<Services>, args: FetchArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn print_listing(pair: &PatchPair, listing: &PairListing) {
+    let compared = match &listing.comparison {
+        Comparison::Done => format!(
+            " · {} changed since {}",
+            listing.files.changed_count().unwrap_or(0),
+            pair.before
+        ),
+        Comparison::Unavailable(why) => format!(" · not compared with {} ({why})", pair.before),
+        Comparison::Pending | Comparison::NotApplicable => String::new(),
+    };
+    println!("  {} files{compared}", listing.files.names.len());
+    let pick = listing.pick().map(|c| c.name.clone());
+    for c in listing.candidates.iter().take(8) {
+        let mut why: Vec<String> = Vec::new();
+        if let Some(Change::Changed { before, after }) = listing.files.change(c.name.as_str()) {
+            let before = before.as_deref().unwrap_or("baseline");
+            why.push(match after {
+                Some(after) => format!("changed {before} → {after}"),
+                None => "changed".into(),
+            });
+        }
+        why.extend(
+            c.evidence
+                .iter()
+                .filter(|e| **e != Evidence::Changed)
+                .map(|e| e.label()),
+        );
+        println!(
+            "  {} {:<24} {:>3}  {}",
+            if pick.as_ref() == Some(&c.name) {
+                "★"
+            } else {
+                " "
+            },
+            c.name.as_str(),
+            c.score,
+            why.join(" · ")
+        );
+    }
+    if listing.candidates.is_empty() {
+        println!("  (no file of {} matches Microsoft's text)", pair.after);
+    }
+    if !listing.missing.is_empty() {
+        let names: Vec<&str> = listing.missing.iter().map(|n| n.as_str()).collect();
+        println!(
+            "  not in {}: {} (named by Microsoft's text)",
+            pair.after,
+            names.join(", ")
+        );
+    }
+}
+
+fn print_hints(report: &CveReport) {
+    let names: Vec<&str> = report
+        .hints
+        .iter()
+        .take(6)
+        .map(|c| c.name.as_str())
+        .collect();
+    if !names.is_empty() {
+        println!(
+            "  Microsoft's text points to: {} (not checked against the update yet)",
+            names.join(", ")
+        );
+    }
+}
+
+fn no_pick(pair: &PatchPair, listing: Option<&PairListing>) -> String {
+    match listing {
+        Some(l) if !l.candidates.is_empty() => format!(
+            "Microsoft's candidates are unchanged between {} and {}; pass --binary NAME to fetch one anyway",
+            pair.before, pair.after
+        ),
+        Some(_) => format!(
+            "no file of {} matches Microsoft's text; pass --binary NAME (--list shows the candidates)",
+            pair.after
+        ),
+        None => "the update's files are unknown; pass --binary NAME".into(),
+    }
 }
 
 #[derive(Default)]

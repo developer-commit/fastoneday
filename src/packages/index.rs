@@ -1,9 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+use super::C2rPackage;
 use crate::{
-    domain::{Arch, BinaryName, PE_EXTENSIONS},
+    domain::{Arch, BinaryName, Change},
     formats::component::{Component, PayloadKind},
 };
 
@@ -111,18 +112,179 @@ impl PackageIndex {
         })
     }
 
-    /// Distinct binary file names, for completion.
-    pub fn binary_names(&self) -> Vec<String> {
+    /// Every distinct file name in the package (completion and browsing).
+    pub fn file_names(&self) -> Vec<String> {
         self.entries
             .iter()
-            .filter(|e| {
-                e.file_name
-                    .rsplit_once('.')
-                    .is_some_and(|(_, ext)| PE_EXTENSIONS.contains(&ext) && ext != "mui")
-            })
+            .filter(|e| e.kind != PayloadKind::Reverse)
             .map(|e| e.file_name.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    /// How each file of this (the after) package differs from `before`, for
+    /// the copy a fetch would use (native component, else the preferred
+    /// Click-to-Run path).
+    ///
+    /// Serviced components compare by version: a component the before
+    /// package does not carry is still at its servicing baseline there, so
+    /// the file changed. Componentless entries (Click-to-Run) compare by
+    /// path and SHA-256. Files whose state cannot be told (no hashes, e.g.
+    /// Office MSP) are left out.
+    pub fn changes_from(&self, before: &PackageIndex, arch: Arch) -> BTreeMap<String, Change> {
+        let mut by_component: HashMap<(String, &str), &PayloadEntry> = HashMap::new();
+        let mut by_path: HashMap<String, &PayloadEntry> = HashMap::new();
+        for e in before
+            .entries
+            .iter()
+            .filter(|e| e.kind != PayloadKind::Reverse)
+        {
+            match e.component_key() {
+                Some(key) => {
+                    by_component.insert((key, e.file_name.as_str()), e);
+                }
+                None => {
+                    by_path.insert(e.path.to_ascii_lowercase(), e);
+                }
+            }
+        }
+        let rank = |e: &PayloadEntry| (e.preference(arch), C2rPackage::path_rank(&e.path, arch));
+        let mut used: BTreeMap<&str, &PayloadEntry> = BTreeMap::new();
+        for e in self
+            .entries
+            .iter()
+            .filter(|e| e.kind != PayloadKind::Reverse)
+        {
+            used.entry(e.file_name.as_str())
+                .and_modify(|kept| {
+                    if rank(e) < rank(kept) {
+                        *kept = e;
+                    }
+                })
+                .or_insert(e);
+        }
+        let mut out = BTreeMap::new();
+        for (name, after) in used {
+            let change = match after.component_key() {
+                Some(key) => match by_component.get(&(key, name)) {
+                    Some(b) if b.version.is_some() && b.version == after.version => Change::Same,
+                    found => Change::Changed {
+                        before: found.and_then(|b| b.version.clone()),
+                        after: after.version.clone(),
+                    },
+                },
+                None => match by_path.get(&after.path.to_ascii_lowercase()) {
+                    _ if after.sha256.is_none() => continue,
+                    Some(b) if b.sha256.is_none() => continue,
+                    Some(b) if b.sha256 == after.sha256 => Change::Same,
+                    found => Change::Changed {
+                        before: found.and_then(|b| b.version.clone()),
+                        after: after.version.clone(),
+                    },
+                },
+            };
+            out.insert(name.to_owned(), change);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn win(component: &str, kind: PayloadKind, file: &str) -> PayloadEntry {
+        let component = Component::parse(component).unwrap();
+        PayloadEntry {
+            path: format!("{}\\f\\{file}", component.key()),
+            file_name: file.into(),
+            kind,
+            version: Some(component.version.clone()),
+            component: Some(component),
+            size: 1,
+            sha256: None,
+            locator: Locator::Cab { chain: vec![] },
+        }
+    }
+
+    fn office(path: &str, sha256: &str) -> PayloadEntry {
+        PayloadEntry {
+            path: path.into(),
+            file_name: path.rsplit('\\').next().unwrap().to_ascii_lowercase(),
+            kind: PayloadKind::Full,
+            component: None,
+            version: Some("16.0.1".into()),
+            size: 1,
+            sha256: Some(sha256.into()),
+            locator: Locator::Stream { path: path.into() },
+        }
+    }
+
+    fn index(entries: Vec<PayloadEntry>) -> PackageIndex {
+        PackageIndex {
+            label: "test".into(),
+            entries,
+        }
+    }
+
+    #[test]
+    fn serviced_files_compare_by_component_version() {
+        let ntfs = |v: &str| format!("amd64_microsoft-windows-ntfs_31bf3856ad364e35_{v}_none_0");
+        let afd =
+            |v: &str| format!("amd64_microsoft-windows-winsock-core_31bf3856ad364e35_{v}_none_0");
+        let wow = "wow64_microsoft-windows-ntfs_31bf3856ad364e35_10.0.26100.9_none_0";
+        let after = index(vec![
+            win(&ntfs("10.0.26100.2"), PayloadKind::Forward, "ntfs.sys"),
+            win(&ntfs("10.0.26100.2"), PayloadKind::Reverse, "ntfs.sys"),
+            win(wow, PayloadKind::Forward, "ntfs.sys"),
+            win(&afd("10.0.26100.1"), PayloadKind::Forward, "afd.sys"),
+            win(&afd("10.0.26100.1"), PayloadKind::Forward, "new.sys"),
+        ]);
+        let before = index(vec![
+            win(&ntfs("10.0.26100.1"), PayloadKind::Forward, "ntfs.sys"),
+            win(&afd("10.0.26100.1"), PayloadKind::Forward, "afd.sys"),
+        ]);
+        let changes = after.changes_from(&before, Arch::X64);
+        // The native amd64 copy is compared, not the wow64 one.
+        assert_eq!(
+            changes["ntfs.sys"],
+            Change::Changed {
+                before: Some("10.0.26100.1".into()),
+                after: Some("10.0.26100.2".into())
+            }
+        );
+        assert_eq!(changes["afd.sys"], Change::Same);
+        // Not in the before package: still the baseline copy there.
+        assert_eq!(
+            changes["new.sys"],
+            Change::Changed {
+                before: None,
+                after: Some("10.0.26100.1".into())
+            }
+        );
+    }
+
+    #[test]
+    fn click_to_run_files_compare_by_path_and_hash() {
+        let after = index(vec![
+            office("root\\Office16\\EXCEL.EXE", "aa"),
+            office("root\\vfs\\ProgramFilesCommonX86\\mso.dll", "x86"),
+            office("root\\vfs\\ProgramFilesCommonX64\\mso.dll", "bb"),
+        ]);
+        let before = index(vec![
+            office("root\\Office16\\EXCEL.EXE", "aa"),
+            office("root\\vfs\\ProgramFilesCommonX64\\mso.dll", "cc"),
+        ]);
+        let changes = after.changes_from(&before, Arch::X64);
+        assert_eq!(changes["excel.exe"], Change::Same);
+        assert!(matches!(changes["mso.dll"], Change::Changed { .. }));
+        let mut unhashed = office("root\\Office16\\WWLIB.DLL", "");
+        unhashed.sha256 = None;
+        assert!(
+            index(vec![unhashed])
+                .changes_from(&before, Arch::X64)
+                .is_empty()
+        );
     }
 }

@@ -7,7 +7,7 @@ mod digest;
 mod product;
 
 pub use artifact::{Acquired, CaseResult, Materialization, Side};
-pub use binary::{BinaryName, Candidate, Evidence, PE_EXTENSIONS};
+pub use binary::{BinaryName, Candidate, Change, Evidence, PE_EXTENSIONS, PairFiles};
 pub use cve::{CveDetail, CveId, CveSummary};
 pub use digest::{Digest, HashAlgorithm, to_hex};
 pub use product::{Arch, Family, PatchPair, UpdateRef, slugify};

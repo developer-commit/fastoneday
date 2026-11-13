@@ -4,7 +4,7 @@ mod normalize;
 
 use std::sync::Arc;
 
-pub use normalize::{MsrcRecord, normalize_detail, normalize_summary};
+pub use normalize::{EngineFix, MsrcRecord, engine_versions, normalize_detail, normalize_summary};
 
 use crate::{
     domain::{CveId, CveSummary},

@@ -10,9 +10,11 @@ USAGE
   fastoneday fetch CVE [OPTIONS]   non-interactive, for scripts
 
 FETCH OPTIONS
-  -b, --binary NAME    binary to fetch (default: best detected candidate)
-  -p, --product N      product row from the list (default: 1, the recommended one)
-  -l, --list           only print products and binary candidates
+  -p, --product N      patch pair row from the list (default: 1, the recommended one)
+  -b, --binary NAME    any file of that pair's update (default: the recommended
+                       file among the update's files)
+  -l, --list           only print the patch pairs and the recommended files of
+                       the chosen pair's update (never downloads a whole package)
 
 GLOBAL OPTIONS
   -w, --workspace DIR  where cases and the cache live

@@ -1,23 +1,27 @@
-//! The four things a user does: browse CVEs, load one, see what the fixing
-//! update carries, and fetch a before/after pair.
+//! The four things a user does: browse CVEs, load one, list the files a
+//! patch pair's fixing update carries (the binaries it offers), and fetch a
+//! before/after pair of one of them.
 
 use std::time::Duration;
 
 use super::{
-    events::CveReport,
+    events::{Comparison, CveReport, PairListing},
     policy::{REMOTE_READABLE_BUILD, build_major, rank_pairs},
     services::Services,
 };
 use crate::{
-    acquire::{Hint, Materialized, Progress},
+    acquire::{Hint, Materialized, Pdb, Progress, UpdateFiles},
     detect::{self, Signals},
     domain::{
-        Acquired, Arch, BinaryName, Candidate, CaseResult, CveDetail, CveId, CveSummary, Digest,
-        Family, PatchPair, Side, UpdateRef,
+        Acquired, Arch, BinaryName, CaseResult, CveDetail, CveId, CveSummary, Digest, Family,
+        PairFiles, PatchPair, Side, UpdateRef,
     },
     error::{Error, Result},
     io::Cancel,
-    sources::office::{Channel, RELEASE_NOTES_URL, Release, parse_release_notes},
+    sources::{
+        msrc::EngineFix,
+        office::{Channel, RELEASE_NOTES_URL, Release, parse_release_notes},
+    },
 };
 
 const RECENT_TTL: Duration = Duration::from_secs(6 * 3600);
@@ -61,6 +65,12 @@ pub fn load_cve(services: &Services, cve: &CveId) -> Result<CveReport> {
     let record = services.msrc.record(cve)?;
     let mut pairs = record.kb_pairs.clone();
     let mut unsupported = record.unsupported.clone();
+    if let Some(fix) = &record.engine {
+        match defender_pairs(services, fix) {
+            Ok(found) => pairs.extend(found),
+            Err(reason) => unsupported.push(reason),
+        }
+    }
     let mut office_app = None;
     let mentions_office = record.c2r_products.len()
         + record
@@ -91,10 +101,9 @@ pub fn load_cve(services: &Services, cve: &CveId) -> Result<CveReport> {
         patches: rank_pairs(pairs),
         unsupported,
     };
-    let candidates = detect::rank(&Signals {
+    let hints = detect::hints(&Signals {
         detail: &detail,
         office_app: office_app.as_deref(),
-        package_names: None,
     });
     let remembered_binary = {
         let mut history = services.history.lock().expect("history");
@@ -105,9 +114,52 @@ pub fn load_cve(services: &Services, cve: &CveId) -> Result<CveReport> {
     Ok(CveReport {
         detail,
         office_app,
-        candidates,
+        hints,
         remembered_binary,
     })
+}
+
+/// Engine-fixed CVEs (Microsoft Defender): one row per CPU architecture the
+/// Defender CDN serves. Before is the last affected engine from the FAQ or,
+/// when the FAQ is silent, the previous engine in Microsoft's release notes.
+fn defender_pairs(
+    services: &Services,
+    fix: &EngineFix,
+) -> std::result::Result<Vec<PatchPair>, String> {
+    let before = match &fix.before {
+        Some(before) => before.clone(),
+        None => match services.engine.defender_previous_engine(&fix.after) {
+            Ok(Some(previous)) => previous,
+            Ok(None) => {
+                return Err(format!(
+                    "{} (no engine release before {} is documented)",
+                    fix.product, fix.after
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "{} (Microsoft Defender release notes unavailable: {e})",
+                    fix.product
+                ));
+            }
+        },
+    };
+    Ok([Arch::X64, Arch::X86, Arch::Arm64]
+        .into_iter()
+        .map(|arch| PatchPair {
+            product: fix.product.clone(),
+            family: Family::DefenderEngine,
+            arch,
+            kind: "Engine update".into(),
+            before: UpdateRef::Engine {
+                version: before.clone(),
+            },
+            after: UpdateRef::Engine {
+                version: fix.after.clone(),
+            },
+            fixed_build: Some(fix.after.clone()),
+        })
+        .collect())
 }
 
 /// Pairs for Click-to-Run products: the build of the release that fixed the
@@ -192,27 +244,112 @@ pub fn click_to_run_pairs(
     (pairs, app, skipped)
 }
 
-/// Binaries carried by the fixing update, and candidates re-ranked with
-/// that knowledge. Returns `None` when it would require a large download.
-pub fn package_names(
+/// The files of a pair's fixing update, or what it takes to know them.
+pub enum Listing {
+    Ready(PairListing),
+    /// Only known after downloading the update's package (`size` bytes).
+    NeedsDownload {
+        package: String,
+        size: Option<u64>,
+    },
+}
+
+/// Lists the fixing update of `pair` and narrows MSRC's hints to its files.
+/// A package that cannot be read in place is downloaded only when
+/// `allow_download` (it is cached, and the fetch uses the same copy).
+pub fn list_pair(
     services: &Services,
     report: &CveReport,
     pair: &PatchPair,
+    allow_download: bool,
     progress: &dyn Progress,
     cancel: &Cancel,
-) -> Result<Option<(Vec<String>, Vec<Candidate>)>> {
-    let Some(names) = services
-        .engine
-        .after_package_names(pair, false, progress, cancel)?
-    else {
-        return Ok(None);
+) -> Result<Listing> {
+    let (files, comparison) =
+        match services
+            .engine
+            .update_files(pair, Side::After, allow_download, progress, cancel)?
+        {
+            UpdateFiles::Package { package, remote } => (
+                PairFiles {
+                    names: package.index().file_names(),
+                    changes: None,
+                    remote,
+                },
+                Comparison::Pending,
+            ),
+            UpdateFiles::Names(names) => (
+                PairFiles {
+                    names,
+                    changes: None,
+                    remote: true,
+                },
+                Comparison::NotApplicable,
+            ),
+            UpdateFiles::NeedsDownload { name, size } => {
+                return Ok(Listing::NeedsDownload {
+                    package: name,
+                    size,
+                });
+            }
+        };
+    let mut listing = PairListing {
+        files,
+        candidates: Vec::new(),
+        missing: Vec::new(),
+        comparison,
     };
-    let candidates = detect::rank(&Signals {
-        detail: &report.detail,
-        office_app: report.office_app.as_deref(),
-        package_names: Some(&names),
-    });
-    Ok(Some((names, candidates)))
+    rerank(report, &mut listing);
+    Ok(Listing::Ready(listing))
+}
+
+/// Marks which listed files differ from the pair's before update and
+/// re-ranks, when the before update can be read without a package download
+/// (24H2+ Windows and Click-to-Run are read in place; an older KB only when
+/// its package is already cached). Sets `listing.comparison`.
+pub fn compare_pair(
+    services: &Services,
+    report: &CveReport,
+    pair: &PatchPair,
+    listing: &mut PairListing,
+    progress: &dyn Progress,
+    cancel: &Cancel,
+) -> Result<()> {
+    if listing.comparison != Comparison::Pending {
+        return Ok(());
+    }
+    let open = |side: Side| {
+        services
+            .engine
+            .update_files(pair, side, false, progress, cancel)
+    };
+    let after = match open(Side::After)? {
+        UpdateFiles::Package { package, .. } => package,
+        _ => {
+            listing.comparison = Comparison::NotApplicable;
+            return Ok(());
+        }
+    };
+    listing.comparison = match open(Side::Before) {
+        Ok(UpdateFiles::Package { package, .. }) => {
+            listing.files.changes = Some(after.index().changes_from(package.index(), pair.arch));
+            Comparison::Done
+        }
+        Ok(UpdateFiles::NeedsDownload { .. }) => {
+            Comparison::Unavailable(format!("{}'s package is not downloaded", pair.before))
+        }
+        Ok(UpdateFiles::Names(_)) => Comparison::NotApplicable,
+        Err(Error::Cancelled) => return Err(Error::Cancelled),
+        Err(e) => Comparison::Unavailable(format!("{} could not be read: {e}", pair.before)),
+    };
+    rerank(report, listing);
+    Ok(())
+}
+
+fn rerank(report: &CveReport, listing: &mut PairListing) {
+    let recommendation = detect::recommend(&report.detail, &report.hints, &listing.files);
+    listing.candidates = recommendation.candidates;
+    listing.missing = recommendation.missing;
 }
 
 /// Like [`acquire_case`], but when `pair` cannot yield a verified binary yet
@@ -264,7 +401,7 @@ fn is_recoverable(error: &Error) -> bool {
 
 fn is_remote(pair: &PatchPair) -> bool {
     match pair.family {
-        Family::OfficeC2r => true,
+        Family::OfficeC2r | Family::DefenderEngine => true,
         Family::Windows => build_major(pair) >= REMOTE_READABLE_BUILD,
         Family::OfficeMsi => false,
     }
@@ -321,14 +458,18 @@ pub fn acquire_case(
                 side.label()
             ));
             match services.engine.pdb(&m.bytes) {
-                Ok(Some((name, bytes))) => {
+                Ok(Pdb::Found { name, bytes }) => {
                     let path = services
                         .workspace
                         .write_side(&directory, side, &name, &bytes)?;
                     step.finish(format!("{name} ({} KB)", bytes.len() / 1024));
                     Some(path)
                 }
-                Ok(None) => {
+                Ok(Pdb::NotNamed) => {
+                    step.finish("none — the file names no PDB".into());
+                    None
+                }
+                Ok(Pdb::NotPublished) => {
                     step.finish("not published".into());
                     None
                 }

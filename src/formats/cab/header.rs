@@ -45,6 +45,8 @@ pub struct FileEntry {
 
 #[derive(Debug, Clone)]
 pub struct Header {
+    /// `cbCabinet`: total size of the cabinet file.
+    pub size: u64,
     pub folders: Vec<FolderEntry>,
     pub files: Vec<FileEntry>,
     /// Reserved bytes at the start of each CFDATA block.
@@ -57,6 +59,7 @@ pub fn parse(source: &dyn ReadAt) -> Result<Header> {
     if first.len() < 36 || &first[..4] != b"MSCF" {
         return Err(Error::format("cabinet", "missing MSCF signature"));
     }
+    let cabinet_size = le::u32(&first, 8) as u64;
     let files_offset = le::u32(&first, 16) as u64;
     let folder_count = le::u16(&first, 26) as usize;
     let file_count = le::u16(&first, 28) as usize;
@@ -125,6 +128,7 @@ pub fn parse(source: &dyn ReadAt) -> Result<Header> {
         }
     }
     Ok(Header {
+        size: cabinet_size,
         folders,
         files,
         data_reserve,

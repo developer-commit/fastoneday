@@ -40,6 +40,9 @@ pub enum Materialization {
     SymbolServer { package: String, url: String },
     /// The unchanged file taken from the release (RTM) install image.
     ReleaseImage { image: String },
+    /// A member of a Microsoft Defender security intelligence package
+    /// (`mpam-fe.exe`), checked against its Authenticode digest.
+    DefenderPackage { package: String, url: String },
     /// Forward delta applied to a base that was itself materialized.
     DeltaApplied {
         package: String,
@@ -60,6 +63,7 @@ impl Materialization {
                 format!("Symbol Server, identity from {package}")
             }
             Self::ReleaseImage { image } => format!("release image {image}"),
+            Self::DefenderPackage { package, .. } => format!("Defender package {package}"),
             Self::DeltaApplied {
                 package,
                 base_version,

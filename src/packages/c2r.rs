@@ -26,7 +26,7 @@ impl C2rPackage {
         cancel: &Cancel,
     ) -> Result<Self> {
         let (stream, dat_url) = cdn.index(channel, build, arch, cancel)?;
-        let entries = stream
+        let mut entries: Vec<PayloadEntry> = stream
             .files()
             .map(|f| PayloadEntry {
                 path: f.path.clone(),
@@ -41,6 +41,10 @@ impl C2rPackage {
                 },
             })
             .collect();
+        // The stream index is a hash map; a stable order keeps the choice
+        // between copies of one file (several install paths) the same on
+        // every run, for the fetch and for the before/after comparison.
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(Self {
             cdn,
             stream,

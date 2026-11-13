@@ -59,6 +59,7 @@ fn family_rank(p: &PatchPair) -> u8 {
         }
         (Family::OfficeC2r, _) => 4,
         (Family::OfficeMsi, _) => 5,
+        (Family::DefenderEngine, _) => 0,
     }
 }
 

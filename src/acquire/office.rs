@@ -22,9 +22,7 @@ pub fn acquire_msi(
     progress: &dyn Progress,
     cancel: &Cancel,
 ) -> Result<Materialized> {
-    let catalog = engine
-        .loader
-        .catalog_package(kb, &pair.product, pair.arch, progress)?;
+    let catalog = engine.catalog(pair, kb, progress)?;
     let package = engine
         .loader
         .office_msi(kb, catalog.primary(), progress, cancel)?;
@@ -72,7 +70,7 @@ fn pick(
             .to_owned();
         let similar: Vec<String> = package
             .index()
-            .binary_names()
+            .file_names()
             .into_iter()
             .filter(|n| stem.len() >= 3 && n.contains(&stem))
             .take(6)

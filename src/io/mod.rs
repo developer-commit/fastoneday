@@ -2,13 +2,15 @@
 //!
 //! Every container parser reads through [`ReadAt`], so the same CAB/WIM code
 //! works on a local file, an in-memory buffer, a slice of another source, a
-//! decompressed CAB folder, or a remote file fetched with HTTP range requests.
+//! decompressed CAB folder, a remote file fetched with HTTP range requests, or
+//! just the pieces of a remote file that were downloaded.
 
 mod control;
 mod cursor;
 mod file;
 mod memory;
 mod slice;
+mod sparse;
 
 use std::sync::Arc;
 
@@ -17,6 +19,7 @@ pub use cursor::SourceCursor;
 pub use file::FileSource;
 pub use memory::MemorySource;
 pub use slice::SliceSource;
+pub use sparse::SparseSource;
 
 use crate::error::{Error, Result};
 

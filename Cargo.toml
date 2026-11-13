@@ -1,6 +1,6 @@
 [package]
 name = "fastoneday"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Terminal UI that fetches exact before/after Microsoft binaries for a CVE so they can be patch-diffed"

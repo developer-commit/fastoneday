@@ -4,6 +4,7 @@
 //!
 //! [`ReadAt`]: crate::io::ReadAt
 
+pub mod authenticode;
 pub mod c2r;
 pub mod cab;
 pub mod cix;

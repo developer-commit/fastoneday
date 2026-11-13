@@ -2,10 +2,11 @@
 //! caches catalog lookups and payload indexes.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
+    thread,
     time::Duration,
 };
 
@@ -41,6 +42,31 @@ pub struct PackageLoader {
     catalog: CatalogClient,
     cache: Cache,
     opened: Mutex<HashMap<String, SharedPackage>>,
+    /// Files being downloaded right now; a second request waits for the first.
+    downloading: Mutex<HashSet<PathBuf>>,
+}
+
+/// A package opened for reading, or why it was not.
+pub enum Opened {
+    Package {
+        package: SharedPackage,
+        /// Read in place (HTTP ranges) rather than from a downloaded copy.
+        remote: bool,
+    },
+    /// Only readable after a full download, which was not allowed.
+    NeedsDownload { name: String, size: Option<u64> },
+}
+
+impl Opened {
+    /// The package, or `NotFound` when it still needs a download.
+    pub fn package(self) -> Result<SharedPackage> {
+        match self {
+            Self::Package { package, .. } => Ok(package),
+            Self::NeedsDownload { name, .. } => {
+                Err(Error::NotFound(format!("{name} needs a download")))
+            }
+        }
+    }
 }
 
 impl PackageLoader {
@@ -50,6 +76,7 @@ impl PackageLoader {
             http,
             cache,
             opened: Mutex::new(HashMap::new()),
+            downloading: Mutex::new(HashSet::new()),
         }
     }
 
@@ -100,11 +127,11 @@ impl PackageLoader {
         cancel: &Cancel,
     ) -> Result<SharedPackage> {
         self.windows_with(kb, file, true, progress, cancel)?
-            .ok_or_else(|| Error::NotFound(format!("{} needs a download", file.name)))
+            .package()
     }
 
-    /// Like [`Self::windows`], but returns `None` instead of starting a large
-    /// download when the package cannot be read remotely.
+    /// Like [`Self::windows`], but reports [`Opened::NeedsDownload`] instead
+    /// of starting a large download when the package cannot be read remotely.
     pub fn windows_with(
         &self,
         kb: &str,
@@ -112,9 +139,13 @@ impl PackageLoader {
         allow_download: bool,
         progress: &dyn Progress,
         cancel: &Cancel,
-    ) -> Result<Option<SharedPackage>> {
+    ) -> Result<Opened> {
         if let Some(hit) = self.memo(&file.url) {
-            return Ok(Some(hit));
+            let remote = !self.is_downloaded(file);
+            return Ok(Opened::Package {
+                package: hit,
+                remote,
+            });
         }
         // A prerequisite (checkpoint) package carries its own KB in its name.
         let own_kb = KB_IN_NAME
@@ -128,7 +159,7 @@ impl PackageLoader {
             &file.url,
             &format!("reading {}", file.name),
         )?);
-        let package: SharedPackage = match sniff(remote.as_ref())? {
+        let (package, read_remotely): (SharedPackage, bool) = match sniff(remote.as_ref())? {
             MsuShape::Wim => {
                 let step = progress.step(format!("Reading the {kb} index remotely (HTTP range)"));
                 remote.set_meter(step.clone());
@@ -163,11 +194,14 @@ impl PackageLoader {
                     )
                 });
                 remote.set_meter(Arc::new(crate::io::NullMeter));
-                Arc::new(package)
+                (Arc::new(package), true)
             }
             MsuShape::Cab => {
                 if !allow_download && !self.is_downloaded(file) {
-                    return Ok(None);
+                    return Ok(Opened::NeedsDownload {
+                        name: file.name.clone(),
+                        size: Some(ReadAt::size(remote.as_ref())),
+                    });
                 }
                 let path =
                     self.download(file, Some(ReadAt::size(remote.as_ref())), progress, cancel)?;
@@ -200,10 +234,13 @@ impl PackageLoader {
                     "{} payloads",
                     UpdatePackage::index(&package).entries.len()
                 ));
-                Arc::new(package)
+                (Arc::new(package), false)
             }
         };
-        Ok(Some(self.remember(&file.url, package)))
+        Ok(Opened::Package {
+            package: self.remember(&file.url, package),
+            remote: read_remotely,
+        })
     }
 
     /// An MSI-Office update cabinet (always downloaded; ~100 MB).
@@ -215,7 +252,7 @@ impl PackageLoader {
         cancel: &Cancel,
     ) -> Result<SharedPackage> {
         self.office_msi_with(kb, file, true, progress, cancel)?
-            .ok_or_else(|| Error::NotFound(format!("{} needs a download", file.name)))
+            .package()
     }
 
     pub fn office_msi_with(
@@ -225,12 +262,21 @@ impl PackageLoader {
         allow_download: bool,
         progress: &dyn Progress,
         cancel: &Cancel,
-    ) -> Result<Option<SharedPackage>> {
+    ) -> Result<Opened> {
         if let Some(hit) = self.memo(&file.url) {
-            return Ok(Some(hit));
+            return Ok(Opened::Package {
+                package: hit,
+                remote: false,
+            });
         }
         if !allow_download && !self.is_downloaded(file) {
-            return Ok(None);
+            return Ok(Opened::NeedsDownload {
+                name: file.name.clone(),
+                size: self
+                    .http
+                    .content_length(&file.url, &format!("sizing {}", file.name))
+                    .ok(),
+            });
         }
         let path = self.download(file, None, progress, cancel)?;
         let step = progress.step(format!("Opening the {kb} patch"));
@@ -244,7 +290,10 @@ impl PackageLoader {
             "{} files",
             UpdatePackage::index(&package).entries.len()
         ));
-        Ok(Some(self.remember(&file.url, Arc::new(package))))
+        Ok(Opened::Package {
+            package: self.remember(&file.url, Arc::new(package)),
+            remote: false,
+        })
     }
 
     fn download_path(&self, file: &PackageFile) -> PathBuf {
@@ -297,6 +346,8 @@ impl PackageLoader {
     ) -> Result<PathBuf> {
         let path = self.download_path(file);
         let marker = path.with_extension("verified");
+        // A file list and a fetch may want the same package at once.
+        let _claim = self.claim(&path, cancel)?;
         if path.is_file() && marker.is_file() {
             progress.note(format!("Reusing cached {}", file.name));
             return Ok(path);
@@ -350,6 +401,38 @@ impl PackageLoader {
         }
         crate::store::write_atomic(&marker, b"ok")?;
         Ok(path)
+    }
+}
+
+impl PackageLoader {
+    /// Waits until no other thread is downloading `path`, then holds it.
+    fn claim(&self, path: &Path, cancel: &Cancel) -> Result<Claim<'_>> {
+        loop {
+            cancel.check()?;
+            if self
+                .downloading
+                .lock()
+                .expect("downloading")
+                .insert(path.to_path_buf())
+            {
+                return Ok(Claim {
+                    set: &self.downloading,
+                    path: path.to_path_buf(),
+                });
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+struct Claim<'a> {
+    set: &'a Mutex<HashSet<PathBuf>>,
+    path: PathBuf,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.set.lock().expect("downloading").remove(&self.path);
     }
 }
 

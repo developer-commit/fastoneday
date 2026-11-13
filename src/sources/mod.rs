@@ -2,6 +2,7 @@
 //! family and returns domain types.
 
 pub mod catalog;
+pub mod defender;
 pub mod msrc;
 pub mod office;
 pub mod symbols;

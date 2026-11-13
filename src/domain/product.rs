@@ -57,6 +57,9 @@ pub enum Family {
     OfficeMsi,
     /// Click-to-Run Office (Microsoft 365 Apps, Office 2019/2021/2024).
     OfficeC2r,
+    /// The Microsoft Defender antimalware engine (`mpengine.dll`), shipped in
+    /// security intelligence packages on the Defender CDN.
+    DefenderEngine,
 }
 
 impl Family {
@@ -65,6 +68,7 @@ impl Family {
             Self::Windows => "Windows",
             Self::OfficeMsi => "Office (MSI)",
             Self::OfficeC2r => "Office (Click-to-Run)",
+            Self::DefenderEngine => "Microsoft Defender engine",
         }
     }
 }
@@ -77,6 +81,8 @@ pub enum UpdateRef {
     Kb { kb: String },
     /// An Office Click-to-Run build on a CDN channel.
     OfficeBuild { channel: String, version: String },
+    /// A Microsoft Defender antimalware engine version (`1.1.x.y`).
+    Engine { version: String },
 }
 
 impl UpdateRef {
@@ -87,7 +93,7 @@ impl UpdateRef {
     pub fn label(&self) -> String {
         match self {
             Self::Kb { kb } => kb.clone(),
-            Self::OfficeBuild { version, .. } => version.clone(),
+            Self::OfficeBuild { version, .. } | Self::Engine { version } => version.clone(),
         }
     }
 }
@@ -133,6 +139,7 @@ impl PatchPair {
             (" (Server Core installation)", " Core"),
             (", 23H2 Edition", " 23H2"),
             ("Microsoft 365 Apps for Enterprise", "M365 Apps"),
+            ("Microsoft Malware Protection Engine", "Defender engine"),
             ("(Current Channel)", "Current"),
             ("Microsoft Office ", "Office "),
             ("Microsoft Outlook ", "Outlook "),
@@ -148,6 +155,22 @@ impl PatchPair {
             name.split_whitespace().collect::<Vec<_>>().join(" "),
             self.arch
         )
+    }
+
+    /// [`Self::short_product`] plus the kind of update when it is not the
+    /// usual cumulative security update (`hotpatch`, `rollup`), so two rows
+    /// of one product — a hotpatch next to the cumulative update — never
+    /// look alike.
+    pub fn label(&self) -> String {
+        let kind = self.kind.to_ascii_lowercase();
+        if self.family != Family::Windows || kind.is_empty() || kind == "security update" {
+            return self.short_product();
+        }
+        let tag = match kind.as_str() {
+            "monthly rollup" => "rollup",
+            other => other,
+        };
+        format!("{} {tag}", self.short_product())
     }
 
     /// Stable directory-safe name for the workspace layout.
@@ -207,6 +230,17 @@ mod tests {
         );
         assert_eq!(office.short_product(), "M365 Apps Current x64");
         assert_eq!(p.slug(), "windows-11-24h2-x64-security-update");
+        assert_eq!(p.label(), "Windows 11 24H2 x64");
+        let mut hotpatch = p.clone();
+        hotpatch.kind = "Hotpatch".into();
+        assert_eq!(hotpatch.label(), "Windows 11 24H2 x64 hotpatch");
+        hotpatch.kind = "Monthly Rollup".into();
+        assert_eq!(hotpatch.label(), "Windows 11 24H2 x64 rollup");
+        let mut engine = pair("Microsoft Malware Protection Engine", Arch::X64);
+        engine.family = Family::DefenderEngine;
+        engine.kind = "Engine update".into();
+        assert_eq!(engine.short_product(), "Defender engine x64");
+        assert_eq!(engine.slug(), "defender-engine-x64-engine-update");
     }
 
     #[test]

@@ -7,12 +7,17 @@ use std::{
 };
 
 use super::{
-    events::{Command, Event, JobId},
+    events::{Command, Comparison, CveReport, Event, JobId},
     progress::ChannelProgress,
     services::Services,
-    usecases,
+    usecases::{self, Listing},
 };
-use crate::{acquire::Silent, error::Error, io::Cancel};
+use crate::{
+    acquire::{Progress, Silent},
+    domain::PatchPair,
+    error::{Error, Result},
+    io::Cancel,
+};
 
 pub struct Worker {
     services: Arc<Services>,
@@ -62,6 +67,7 @@ impl Worker {
                         Ok(report) => Event::CveLoaded(Box::new(report)),
                         Err(e) => Event::CveFailed {
                             cve,
+                            hint: super::hints::lookup(&e),
                             error: e.to_string(),
                         },
                     };
@@ -79,21 +85,28 @@ impl Worker {
                     previous.cancel();
                 }
                 thread::spawn(move || {
-                    let event = match usecases::package_names(
-                        &services, &report, &pair, &Silent, &cancel,
+                    let _ =
+                        list_and_compare(&services, &report, &pair, false, &Silent, &cancel, &tx);
+                });
+            }
+            Command::ListFiles { job, report, pair } => {
+                let cancel = self.register(job);
+                let jobs = self.jobs.clone();
+                thread::spawn(move || {
+                    let progress = ChannelProgress::new(tx.clone(), job);
+                    let event = match list_and_compare(
+                        &services, &report, &pair, true, &progress, &cancel, &tx,
                     ) {
-                        Ok(Some((names, candidates))) => Event::PackageNames {
-                            pair,
-                            names,
-                            candidates,
-                        },
-                        Ok(None) => return,
-                        Err(Error::Cancelled) => return,
-                        Err(e) => Event::PackageNamesFailed {
-                            pair,
+                        Ok(()) => Event::ListDone { job },
+                        Err(e) => Event::CaseFailed {
+                            job,
+                            hint: super::hints::fetch(&e),
+                            cancelled: matches!(e, Error::Cancelled),
                             error: e.to_string(),
                         },
                     };
+                    drop(progress);
+                    jobs.lock().expect("jobs").remove(&job);
                     let _ = tx.send(event);
                 });
             }
@@ -104,14 +117,7 @@ impl Worker {
                 binary,
                 fallback,
             } => {
-                let cancel = Cancel::new();
-                {
-                    let mut jobs = self.jobs.lock().expect("jobs");
-                    for other in jobs.values() {
-                        other.cancel();
-                    }
-                    jobs.insert(job, cancel.clone());
-                }
+                let cancel = self.register(job);
                 let jobs = self.jobs.clone();
                 thread::spawn(move || {
                     let progress = ChannelProgress::new(tx.clone(), job);
@@ -127,6 +133,8 @@ impl Worker {
                         },
                         Err(e) => Event::CaseFailed {
                             job,
+                            hint: super::hints::fetch(&e),
+                            cancelled: matches!(e, Error::Cancelled),
                             error: e.to_string(),
                         },
                     };
@@ -142,4 +150,66 @@ impl Worker {
             }
         }
     }
+
+    /// One job runs at a time: a new one cancels the others.
+    fn register(&self, job: JobId) -> Cancel {
+        let cancel = Cancel::new();
+        let mut jobs = self.jobs.lock().expect("jobs");
+        for other in jobs.values() {
+            other.cancel();
+        }
+        jobs.insert(job, cancel.clone());
+        cancel
+    }
+}
+
+/// Lists `pair` and reports it at once, then compares it with the before
+/// update and reports it again. Every outcome becomes an event; the error is
+/// also returned so a job can report how it ended.
+fn list_and_compare(
+    services: &Services,
+    report: &CveReport,
+    pair: &PatchPair,
+    allow_download: bool,
+    progress: &dyn Progress,
+    cancel: &Cancel,
+    tx: &Sender<Event>,
+) -> Result<()> {
+    let cve = &report.detail.summary.id;
+    let listed = usecases::list_pair(services, report, pair, allow_download, progress, cancel);
+    let mut listing = match listed {
+        Ok(Listing::Ready(listing)) => listing,
+        Ok(Listing::NeedsDownload { package, size }) => {
+            let _ = tx.send(Event::PairNeedsDownload {
+                cve: cve.clone(),
+                pair: pair.clone(),
+                package,
+                size,
+            });
+            return Ok(());
+        }
+        Err(Error::Cancelled) => return Err(Error::Cancelled),
+        Err(e) => {
+            let _ = tx.send(Event::PairListFailed {
+                cve: cve.clone(),
+                pair: pair.clone(),
+                error: e.to_string(),
+            });
+            return Err(e);
+        }
+    };
+    let _ = tx.send(Event::PairListed {
+        cve: cve.clone(),
+        pair: pair.clone(),
+        listing: Box::new(listing.clone()),
+    });
+    if listing.comparison == Comparison::Pending {
+        usecases::compare_pair(services, report, pair, &mut listing, progress, cancel)?;
+        let _ = tx.send(Event::PairListed {
+            cve: cve.clone(),
+            pair: pair.clone(),
+            listing: Box::new(listing),
+        });
+    }
+    Ok(())
 }

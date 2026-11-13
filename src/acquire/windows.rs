@@ -24,9 +24,7 @@ pub fn acquire(
 ) -> Result<Materialized> {
     let prefer_key = hint.component_key();
     let prefer_component = prefer_key.as_deref();
-    let catalog = engine
-        .loader
-        .catalog_package(kb, &pair.product, pair.arch, progress)?;
+    let catalog = engine.catalog(pair, kb, progress)?;
     let primary = engine
         .loader
         .windows(kb, catalog.primary(), progress, cancel)?;
@@ -171,7 +169,7 @@ fn similar_names(package: &SharedPackage, binary: &BinaryName) -> Vec<String> {
     let stem = binary.as_str().split('.').next().unwrap_or_default();
     package
         .index()
-        .binary_names()
+        .file_names()
         .into_iter()
         .filter(|n| stem.len() >= 3 && n.contains(stem))
         .take(6)
